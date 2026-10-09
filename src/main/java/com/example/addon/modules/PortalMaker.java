@@ -7,6 +7,11 @@ import org.lwjgl.glfw.GLFW;
 
 import com.example.addon.Tim;
 
+import baritone.api.BaritoneAPI;
+import baritone.api.IBaritone;
+import baritone.api.behavior.IPathingBehavior;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.process.IBaritoneProcess;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
@@ -26,12 +31,6 @@ import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
-import baritone.api.BaritoneAPI;
-import baritone.api.IBaritone;
-import baritone.api.behavior.IPathingBehavior;
-import baritone.api.pathing.goals.GoalBlock;
-import baritone.api.process.IBaritoneProcess;
-import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.item.Item;
