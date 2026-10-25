@@ -52,6 +52,7 @@ import com.example.addon.modules.RocketPilot;
 import com.example.addon.modules.SafetyNet;
 import com.example.addon.modules.ServerHealthcareSystem;
 import com.example.addon.modules.SignScanner;
+import com.example.addon.modules.Skipper;
 import com.example.addon.modules.ThirdSight;
 import com.example.addon.modules.Threaturn;
 import com.example.addon.modules.Timethrottle;
@@ -85,6 +86,7 @@ public class Tim extends MeteorAddon {
         modules.add(new ElytraAssistant());
         modules.add(new Gatekeeper());
         modules.add(new Graveyard());
+        modules.add(new Groundwork());
         modules.add(new Handhold());
         modules.add(new Handmold());
         modules.add(new Illushine());
@@ -100,11 +102,11 @@ public class Tim extends MeteorAddon {
         modules.add(new PortalMaker());
         modules.add(new Raidar());
         modules.add(new Ringmaster());
-        modules.add(new Groundwork());
         modules.add(new RocketPilot());
         modules.add(new SafetyNet());
         modules.add(new ServerHealthcareSystem());
         modules.add(new SignScanner());
+        modules.add(new Skipper());
         modules.add(new ThirdSight());
         modules.add(new Threaturn());
         modules.add(new Timethrottle());

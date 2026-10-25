@@ -23,6 +23,7 @@
     "EntityMixin",
     "HandledScreenAccessor",
     "HandledScreenMixin",
+    "HighlighterRegistryMixin",
     "HandmoldBobMixin",
     "HandmoldMixin",
     "HeldItemRendererAccessor",

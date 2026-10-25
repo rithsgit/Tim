@@ -20,6 +20,13 @@ repositories {
     maven {
         name = "Modrinth"
         url = uri("https://api.modrinth.com/maven")
+        content {
+            includeGroup("maven.modrinth")
+        }
+    }
+    maven {
+        name = "Cabaletta (Baritone)"
+        url = uri("https://pkgs.dev.azure.com/cabaletta/baritone/_packaging/baritone/maven/v1")
     }
 }
 
@@ -32,8 +39,14 @@ dependencies {
     // Meteor
     modImplementation(libs.meteor.client)
 
-    // Baritone (API jar for MC 1.21.4)
-    modCompileOnly(files("libs/baritone-api-fabric-1.13.1.jar"))
+    // Baritone (Using local jar or public repository)
+    modImplementation(files("libs/baritone-api-fabric-1.13.1.jar"))
+
+    // Xaero's World Map & XaeroPlus (1.21.4)
+    // Use modCompileOnly to build against their APIs without bundling them,
+    // or swap to modImplementation if you want them loaded in ./gradlew runClient
+    modCompileOnly("maven.modrinth:xaeros-world-map:1.39.2_Fabric_1.21.4")
+    modCompileOnly("maven.modrinth:xaeroplus:2.25+fabric-1.21.4")
 }
 
 tasks {

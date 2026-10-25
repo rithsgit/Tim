@@ -20,7 +20,7 @@ public class TimeThrottleHUD extends HudElement {
 
     public static final HudElementInfo<TimeThrottleHUD> INFO = new HudElementInfo<>(
         Tim.HUD_GROUP,
-        "time-throttle-hud",
+        "time-throttle",
         "Visualizes time throttle speeds, active focus mode, and overload states.",
         TimeThrottleHUD::new
     );
