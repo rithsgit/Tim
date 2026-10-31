@@ -120,6 +120,13 @@ public class RocketPilot extends Module {
         .build()
     );
 
+    public final Setting<Boolean> ignoreElytra = sgFlight.add(new BoolSetting.Builder()
+        .name("ignore-elytra")
+        .description("Keeps RocketPilot active and running patterns even when an elytra is not equipped or another module manages flight/chestplate.")
+        .defaultValue(false)
+        .build()
+    );
+
     public final Setting<Boolean> useTargetY = sgFlight.add(new BoolSetting.Builder()
         .name("use-target-y")
         .description("Whether to maintain a specific Y level.")
@@ -806,6 +813,12 @@ public class RocketPilot extends Module {
     }
 
     // ─── Utilities ───────────────────────────────────────────────────────────────
+    private boolean hasEquippedElytra() {
+        if (mc.player == null) return false;
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        return !elytra.isEmpty() && elytra.isOf(Items.ELYTRA);
+    }
+
     private boolean isPatternMode() {
         if (flightPattern.get() == FlightPattern.Manual) return false;
         if (flightPattern.get() == FlightPattern.Drunk && drunkSpiralMode.get() == DrunkSpiralMode.None) return false;
@@ -900,11 +913,10 @@ public class RocketPilot extends Module {
         targetPitch    = mc.player.getPitch();
         targetDrunkYaw = mc.player.getYaw();
 
-        if (mc.player.isGliding()) return;
+        if (mc.player.isGliding() || ignoreElytra.get()) return;
         if (!autoTakeoff.get())    return;
 
-        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
-        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) {
+        if (!hasEquippedElytra()) {
             error("No elytra equipped.");
             toggle();
             return;
@@ -968,8 +980,8 @@ public class RocketPilot extends Module {
             }
         }
 
-        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
-        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) {
+        boolean hasElytra = hasEquippedElytra();
+        if (!hasElytra && !ignoreElytra.get()) {
             error("Elytra missing — disabling.");
             toggle();
             return;
@@ -1002,7 +1014,7 @@ public class RocketPilot extends Module {
             wantsToFly = true;
         }
 
-        if (isNearGround() && !mc.player.isGliding() && wantsToFly && autoTakeoff.get() && countFireworks() > 0 && !needsTakeoffRocket) {
+        if (hasElytra && !ignoreElytra.get() && isNearGround() && !mc.player.isGliding() && wantsToFly && autoTakeoff.get() && countFireworks() > 0 && !needsTakeoffRocket) {
             targetPitch = -28.0f;
             mc.player.setPitch(targetPitch);
             if (mc.player.isOnGround()) mc.player.jump();
@@ -1012,13 +1024,20 @@ public class RocketPilot extends Module {
         }
 
         if (needsTakeoffRocket) {
-            handleTakeoff();
-            return;
+            if (!hasElytra || ignoreElytra.get()) {
+                needsTakeoffRocket = false;
+                takeoffWaitTicks   = 0;
+            } else {
+                handleTakeoff();
+                return;
+            }
         }
 
-        if (!mc.player.isGliding()) return;
+        if (!mc.player.isGliding() && !ignoreElytra.get()) return;
 
-        handleElytraHealth();
+        if (hasElytra && !ignoreElytra.get()) {
+            handleElytraHealth();
+        }
 
         Float desiredPitch  = null;
         boolean safetyOverride = false;
@@ -1070,7 +1089,9 @@ public class RocketPilot extends Module {
     // ─── Ebounce Mode Logic ──────────────────────────────────────────────────────
     private void handleEbounceTick() {
         if (mc.player == null || mc.world == null) return;
-        handleElytraHealth();
+        if (hasEquippedElytra() && !ignoreElytra.get()) {
+            handleElytraHealth();
+        }
 
         IBaritone baritone = ebounceObstacle.get() ? BaritoneAPI.getProvider().getPrimaryBaritone() : null;
 
@@ -1092,10 +1113,11 @@ public class RocketPilot extends Module {
             ebouncePass = false;
         }
 
-        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
-        if (elytra.isEmpty() || !elytra.isOf(Items.ELYTRA)) {
-            error("Elytra missing — disabling.");
-            toggle();
+        if (!hasEquippedElytra()) {
+            if (!ignoreElytra.get()) {
+                error("Elytra missing — disabling.");
+                toggle();
+            }
             return;
         }
 
@@ -1300,7 +1322,7 @@ public class RocketPilot extends Module {
 
     // ─── Collision Avoidance ──────────────────────────────────────────────────────
     private Float handleCollisionAvoidance() {
-        if (!mc.player.isGliding() || mc.player.getPitch() >= 30) return null;
+        if ((!mc.player.isGliding() && !ignoreElytra.get()) || mc.player.getPitch() >= 30) return null;
 
         Vec3d camPos   = mc.player.getCameraPosVec(1.0f);
         Vec3d velocity = mc.player.getVelocity();

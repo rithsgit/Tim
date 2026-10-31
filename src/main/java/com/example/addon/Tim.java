@@ -27,6 +27,7 @@ import com.example.addon.modules.Baromine;
 import com.example.addon.modules.ChambersAssistant;
 import com.example.addon.modules.CityAssistant;
 import com.example.addon.modules.Datamine;
+import com.example.addon.modules.DogTag;
 import com.example.addon.modules.DungeonAssistant;
 import com.example.addon.modules.EightToOne;
 import com.example.addon.modules.ElytraAssistant;
@@ -81,6 +82,7 @@ public class Tim extends MeteorAddon {
         modules.add(new ChambersAssistant());
         modules.add(new CityAssistant());
         modules.add(new Datamine());
+        modules.add(new DogTag());
         modules.add(new DungeonAssistant());
         modules.add(new EightToOne());
         modules.add(new ElytraAssistant());

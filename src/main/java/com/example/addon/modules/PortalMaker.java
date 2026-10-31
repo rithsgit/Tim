@@ -36,12 +36,15 @@ import net.minecraft.block.Blocks;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.shape.VoxelShape;
 
 public class PortalMaker extends Module {
 
@@ -248,6 +251,7 @@ public class PortalMaker extends Module {
     private Vec3d   stepOutTarget    = null;
     private int     recycleWaitTimer = 0;
     private boolean wasRecyclePressed = false;
+    private boolean hasWarnedThrowaway = false;
 
     private boolean originalEnterPortal = true;
     private boolean originalAllowPlace = true;
@@ -259,7 +263,11 @@ public class PortalMaker extends Module {
         super(Tim.CATEGORY, "portal-maker", "Builds and lights a minimal Nether portal (10 obsidian).");
     }
 
-    // ── Safe Block State Helper ────────────────────────────────────
+    // ── Safe Block State & Position Helpers ────────────────────────
+    private Vec3d playerPos() {
+        return new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+    }
+
     private BlockState getSafeBlockState(BlockPos pos) {
         if (mc.world == null) return Blocks.AIR.getDefaultState();
         try {
@@ -292,6 +300,7 @@ public class PortalMaker extends Module {
         recycleState     = RecycleState.IDLE;
         lastDimension    = "";
         wasRecyclePressed = false;
+        hasWarnedThrowaway = false;
         builtDimension   = "";
         portalLitDetected = false;
         dimensionChangeCooldown = 0;
@@ -331,8 +340,9 @@ public class PortalMaker extends Module {
 
         if (!hasItem(Items.FLINT_AND_STEEL)) warning("No flint & steel found — light manually.");
 
-        if (useBaritone.get() && !hasThrowawayBlocks()) {
+        if (useBaritone.get() && !hasThrowawayBlocks() && !hasWarnedThrowaway) {
             warning("No throwaway blocks (dirt, cobblestone, etc.) found! Baritone may fail to bridge to the portal.");
+            hasWarnedThrowaway = true;
         }
 
         Direction facing = mc.player.getHorizontalFacing();
@@ -436,11 +446,16 @@ public class PortalMaker extends Module {
 
         if (builtDimension.isEmpty()) builtDimension = currentDim;
 
+        // If dimension changed and auto-recycle is NOT active, disable cleanly instead of staying stuck on
         if (!currentDim.equals(lastDimension)) {
             lastDimension = currentDim;
             portalFramePositions.clear();
+            stopMovement();
             if (useBaritone.get() && autoRecycle.get()) {
                 dimensionChangeCooldown = dimensionSwitchCooldownTicks.get();
+            } else {
+                info("PortalMaker finished.");
+                toggle();
             }
             return;
         }
@@ -471,9 +486,12 @@ public class PortalMaker extends Module {
             return;
         }
 
-        if (isPlayerInPortal()) {
+        // Only stop movement and disable once the player is solidly inside the thin portal pane
+        // and settled near the center of the portal opening (or Baritone has finished its path).
+        if (isPlayerSolidlyInPortal(getPortalOpeningCenter())) {
             stopMovement();
-            if (useBaritone.get() && !autoRecycle.get() && !recycleKey.get().isSet() && recycleState == RecycleState.IDLE) {
+            if (!(useBaritone.get() && autoRecycle.get())) {
+                info("Entered portal -> disabling PortalMaker.");
                 toggle();
             }
             return;
@@ -500,13 +518,17 @@ public class PortalMaker extends Module {
         }
 
         if (placementIndex < portalFramePositions.size()) {
-            if (mc.player.getInventory().main.isEmpty()) return;
+            if (mc.player.getInventory().isEmpty()) return;
 
             if (!mc.player.getMainHandStack().isOf(Items.OBSIDIAN)) {
                 FindItemResult obsidian = InvUtils.find(Items.OBSIDIAN);
                 if (!obsidian.found()) { error("No obsidian found -> disabled."); toggle(); return; }
-                if (obsidian.isHotbar()) mc.player.getInventory().selectedSlot = obsidian.slot();
-                else InvUtils.move().from(obsidian.slot()).toHotbar(mc.player.getInventory().selectedSlot);
+                if (obsidian.isHotbar()) {
+                    InvUtils.swap(obsidian.slot(), false);
+                } else {
+                    InvUtils.move().from(obsidian.slot()).toHotbar(0);
+                    InvUtils.swap(0, false);
+                }
             }
 
             tickTimer++;
@@ -649,11 +671,10 @@ public class PortalMaker extends Module {
                         recycleState = RecycleState.WAITING;
                         return;
                     } else {
-                        // Still somehow in the portal, try pathing out again
+                        // Still in the portal, try pathing out again
                         moveTo(stepOutTarget);
                     }
                 }
-                // If Baritone is not idle, it is still walking. Do nothing and let it finish.
             }
             case WAITING -> {
                 stopMovement(); 
@@ -663,8 +684,8 @@ public class PortalMaker extends Module {
                 }
             }
             case RE_ENTERING -> {
-                // If we entered the portal, we are done
-                if (isPlayerInPortal()) {
+                // Only stop and disable once solidly inside the portal pane and centered
+                if (isPlayerSolidlyInPortal(recycleTarget)) {
                     stopMovement();
                     toggle();
                     return;
@@ -721,8 +742,8 @@ public class PortalMaker extends Module {
 
         if (getSafeBlockState(pos).isOf(Blocks.NETHER_PORTAL)) {
             BlockState state = getSafeBlockState(pos);
-            Direction.Axis axis = state.contains(net.minecraft.state.property.Properties.HORIZONTAL_AXIS) 
-                ? state.get(net.minecraft.state.property.Properties.HORIZONTAL_AXIS) 
+            Direction.Axis axis = state.contains(Properties.HORIZONTAL_AXIS) 
+                ? state.get(Properties.HORIZONTAL_AXIS) 
                 : Direction.Axis.X;
 
             int minC = axis == Direction.Axis.X ? pos.getX() : pos.getZ();
@@ -765,8 +786,8 @@ public class PortalMaker extends Module {
                 else stepOutTarget = o1;
             }
         } else {
-            recycleTarget = mc.player.getPos();
-            stepOutTarget = mc.player.getPos().add(mc.player.getRotationVector().multiply(-2.0));
+            recycleTarget = playerPos();
+            stepOutTarget = playerPos().add(mc.player.getRotationVector().multiply(-2.0));
         }
     }
 
@@ -778,12 +799,58 @@ public class PortalMaker extends Module {
     }
 
     // ── Portal Helpers ─────────────────────────────────────────────
+    /**
+     * Checks if the player's contracted bounding box intersects the actual thin
+     * VoxelShape (0.375 -> 0.625) of a NETHER_PORTAL block rather than just its
+     * outer 1x1x1 block coordinate.
+     */
     private boolean isPlayerInPortal() {
         if (mc.player == null || mc.world == null) return false;
-        BlockPos feet = mc.player.getBlockPos();
-        if (!isChunkSafe(feet)) return false;
-        return getSafeBlockState(feet).isOf(Blocks.NETHER_PORTAL) ||
-               getSafeBlockState(feet.up()).isOf(Blocks.NETHER_PORTAL);
+
+        // Contract slightly horizontally so grazing the outer edge doesn't trigger an early stop
+        Box playerBox = mc.player.getBoundingBox().contract(0.1, 0.0, 0.1);
+        int minX = MathHelper.floor(playerBox.minX);
+        int minY = MathHelper.floor(playerBox.minY);
+        int minZ = MathHelper.floor(playerBox.minZ);
+        int maxX = MathHelper.floor(playerBox.maxX);
+        int maxY = MathHelper.floor(playerBox.maxY);
+        int maxZ = MathHelper.floor(playerBox.maxZ);
+
+        BlockPos.Mutable pos = new BlockPos.Mutable();
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    pos.set(x, y, z);
+                    if (!isChunkSafe(pos)) continue;
+
+                    BlockState state = getSafeBlockState(pos);
+                    if (state.isOf(Blocks.NETHER_PORTAL)) {
+                        VoxelShape shape = state.getOutlineShape(mc.world, pos);
+                        if (!shape.isEmpty()) {
+                            Box portalShapeBox = shape.getBoundingBox().offset(pos);
+                            if (playerBox.intersects(portalShapeBox)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Ensures the player is both intersecting the thin portal pane AND either close to the
+     * target center or Baritone has completed pathing, preventing premature braking on the obsidian lip.
+     */
+    private boolean isPlayerSolidlyInPortal(Vec3d targetCenter) {
+        if (!isPlayerInPortal()) return false;
+        if (mc.player == null || targetCenter == null) return true;
+
+        double horizontalDistSq = MathHelper.square(mc.player.getX() - targetCenter.x)
+                                + MathHelper.square(mc.player.getZ() - targetCenter.z);
+
+        return horizontalDistSq <= 0.0625 || isBaritoneIdle();
     }
 
     private void lightPortal() {
@@ -833,29 +900,27 @@ public class PortalMaker extends Module {
             return;
         }
 
-        // Use BlockPos.ofFloored to accurately get the block coordinates from the Vec3d.
-        // This prevents rounding errors that could target the block adjacent to the portal.
         BlockPos targetPos = BlockPos.ofFloored(target.x, target.y, target.z);
-        
-        // Use the Baritone API directly to avoid command manager chat spam (prevents coordinate leaks)
         IBaritone baritone = BaritoneAPI.getProvider().getPrimaryBaritone();
         
-        // Only issue the path command if Baritone isn't already trying to path there
-        // GoalBlock is used because it forces the player's feet into the exact portal block,
-        // ensuring the teleport triggers reliably.
         if (isBaritoneIdle()) {
             baritone.getCustomGoalProcess().setGoalAndPath(new GoalBlock(targetPos));
         }
     }
 
+    /**
+     * Picks the closer of the two lower portal blocks and returns its exact center
+     * so Baritone walks squarely into a portal block instead of targeting the seam.
+     */
     private Vec3d getPortalOpeningCenter() {
+        if (portalFramePositions.size() < 2) return mc.player != null ? playerPos() : Vec3d.ZERO;
         BlockPos p1 = portalFramePositions.get(0).up();
         BlockPos p2 = portalFramePositions.get(1).up();
-        return new Vec3d(
-            (p1.getX() + p2.getX()) / 2.0 + 0.5,
-             p1.getY(),
-            (p1.getZ() + p2.getZ()) / 2.0 + 0.5
-        );
+        Vec3d c1 = Vec3d.ofBottomCenter(p1);
+        Vec3d c2 = Vec3d.ofBottomCenter(p2);
+        if (mc.player == null) return c1;
+        Vec3d pPos = playerPos();
+        return pPos.squaredDistanceTo(c1) <= pPos.squaredDistanceTo(c2) ? c1 : c2;
     }
 
     // ── Placement Helpers ──────────────────────────────────────────
@@ -955,7 +1020,7 @@ public class PortalMaker extends Module {
         if (mc.player == null) return false;
         for (int i = 0; i < 9; i++) {
             if (mc.player.getInventory().getStack(i).getItem() == targetItem) {
-                mc.player.getInventory().selectedSlot = i;
+                InvUtils.swap(i, false);
                 return true;
             }
         }

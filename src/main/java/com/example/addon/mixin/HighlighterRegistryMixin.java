@@ -15,10 +15,10 @@ import xaero.map.highlight.HighlighterRegistry;
 @Pseudo
 @Mixin(value = HighlighterRegistry.class, remap = false)
 public abstract class HighlighterRegistryMixin {
-    @Shadow
+    @Shadow(remap = false)
     public abstract void register(AbstractHighlighter highlighter);
 
-    @Inject(method = "<init>", at = @At("TAIL"))
+    @Inject(method = "<init>", at = @At("TAIL"), require = 0, remap = false)
     private void onInit(CallbackInfo ci) {
         register(new SkipperHud((cx, cz) -> {
             Skipper skipper = Modules.get().get(Skipper.class);

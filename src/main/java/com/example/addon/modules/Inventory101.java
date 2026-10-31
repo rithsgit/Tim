@@ -1,6 +1,7 @@
 package com.example.addon.modules;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -8,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -30,6 +32,7 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -39,6 +42,7 @@ import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.BundleContentsComponent;
 import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
@@ -449,7 +453,7 @@ public class Inventory101 extends Module {
     // ── Cleaner ──
     private final Setting<Boolean> autoTrash = sgCleaner.add(new BoolSetting.Builder()
         .name("auto-trash")
-        .description("Automatically discards whitelisted items (drops in world, throws in containers).")
+        .description("Automatically discards whitelisted items (drops in world/chat, throws in containers).")
         .defaultValue(false).build()
     );
 
@@ -512,6 +516,25 @@ public class Inventory101 extends Module {
     private boolean drawingOverlay = false;
     private static final WeakHashMap<ItemStack, CachedDominant> dominantCache = new WeakHashMap<>();
 
+    // ── Cross-Version Reflection Caches (1.21.4 - 1.21.11) ──
+    private static Method  GET_SELECTED_SLOT_METHOD = null;
+    private static Field   SELECTED_SLOT_FIELD      = null;
+    private static boolean SLOT_REFLECTION_INIT     = false;
+
+    private static Method  NBT_PARSE_METHOD         = null;
+    private static Method  NBT_GET_LIST_1_METHOD    = null;
+    private static Method  NBT_GET_LIST_2_METHOD    = null;
+    private static Method  NBT_LIST_GET_CMP_METHOD  = null;
+    private static Method  NBT_CMP_GET_INT_METHOD   = null;
+    private static boolean NBT_REFLECTION_INIT      = false;
+
+    private static Method  MATRIX_PUSH_METHOD       = null;
+    private static Method  MATRIX_POP_METHOD        = null;
+    private static Method  MATRIX_TRANSLATE_METHOD  = null;
+    private static Method  MATRIX_SCALE_METHOD      = null;
+    private static boolean MATRIX_IS_2D             = false;
+    private static boolean MATRIX_REFLECTION_INIT   = false;
+
     private static class CachedDominant {
         private final Object data;
         private final ItemStack stack;
@@ -557,6 +580,125 @@ public class Inventory101 extends Module {
         dominantCache.clear();
         drawingOverlay = false;
     }
+
+    // ── Cross-Version Helpers (1.21.4, 1.21.5, 1.21.8, 1.21.11) ──────────────
+
+    private int getSelectedSlot() {
+        if (mc.player == null) return 0;
+        PlayerInventory inv = mc.player.getInventory();
+
+        if (!SLOT_REFLECTION_INIT) {
+            SLOT_REFLECTION_INIT = true;
+            try {
+                GET_SELECTED_SLOT_METHOD = PlayerInventory.class.getMethod("getSelectedSlot");
+            } catch (NoSuchMethodException e1) {
+                try {
+                    GET_SELECTED_SLOT_METHOD = PlayerInventory.class.getMethod("method_67532");
+                } catch (NoSuchMethodException ignored) {}
+            }
+
+            if (GET_SELECTED_SLOT_METHOD == null) {
+                for (String fieldName : new String[]{"selectedSlot", "field_7545"}) {
+                    try {
+                        Field f = PlayerInventory.class.getDeclaredField(fieldName);
+                        f.setAccessible(true);
+                        SELECTED_SLOT_FIELD = f;
+                        break;
+                    } catch (NoSuchFieldException ignored) {}
+                }
+            }
+        }
+
+        try {
+            if (GET_SELECTED_SLOT_METHOD != null) {
+                return (int) GET_SELECTED_SLOT_METHOD.invoke(inv);
+            } else if (SELECTED_SLOT_FIELD != null) {
+                return SELECTED_SLOT_FIELD.getInt(inv);
+            }
+        } catch (Exception ignored) {}
+
+        return 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object unwrapOptional(Object val) {
+        if (val instanceof Optional<?> opt) return opt.orElse(null);
+        return val;
+    }
+
+    private static void initNbtReflection() {
+        if (NBT_REFLECTION_INIT) return;
+        NBT_REFLECTION_INIT = true;
+
+        for (String name : new String[]{"readCompound", "parse", "method_68122", "method_10718"}) {
+            try {
+                NBT_PARSE_METHOD = StringNbtReader.class.getMethod(name, String.class);
+                break;
+            } catch (NoSuchMethodException ignored) {}
+        }
+
+        for (String name : new String[]{"getList", "method_10554"}) {
+            try {
+                NBT_GET_LIST_1_METHOD = NbtCompound.class.getMethod(name, String.class);
+                break;
+            } catch (NoSuchMethodException ignored) {}
+            try {
+                NBT_GET_LIST_2_METHOD = NbtCompound.class.getMethod(name, String.class, int.class);
+                break;
+            } catch (NoSuchMethodException ignored) {}
+        }
+
+        for (String name : new String[]{"getCompound", "method_10602"}) {
+            try {
+                NBT_LIST_GET_CMP_METHOD = NbtList.class.getMethod(name, int.class);
+                break;
+            } catch (NoSuchMethodException ignored) {}
+        }
+
+        for (String name : new String[]{"getInt", "method_10550"}) {
+            try {
+                NBT_CMP_GET_INT_METHOD = NbtCompound.class.getMethod(name, String.class);
+                break;
+            } catch (NoSuchMethodException ignored) {}
+        }
+    }
+
+    private static NbtCompound parseNbtCompoundCompat(String nbtString) throws Exception {
+        initNbtReflection();
+        if (NBT_PARSE_METHOD != null) {
+            return (NbtCompound) NBT_PARSE_METHOD.invoke(null, nbtString);
+        }
+        return null;
+    }
+
+    private static NbtList getNbtListCompat(NbtCompound nbt, String key) throws Exception {
+        initNbtReflection();
+        if (NBT_GET_LIST_1_METHOD != null) {
+            return (NbtList) unwrapOptional(NBT_GET_LIST_1_METHOD.invoke(nbt, key));
+        } else if (NBT_GET_LIST_2_METHOD != null) {
+            return (NbtList) unwrapOptional(NBT_GET_LIST_2_METHOD.invoke(nbt, key, (int) NbtElement.COMPOUND_TYPE));
+        }
+        return null;
+    }
+
+    private static NbtCompound getCompoundAtCompat(NbtList list, int index) throws Exception {
+        initNbtReflection();
+        if (NBT_LIST_GET_CMP_METHOD != null) {
+            return (NbtCompound) unwrapOptional(NBT_LIST_GET_CMP_METHOD.invoke(list, index));
+        }
+        return null;
+    }
+
+    private static int getIntCompat(NbtCompound cmp, String key) throws Exception {
+        initNbtReflection();
+        if (NBT_CMP_GET_INT_METHOD != null) {
+            Object val = unwrapOptional(NBT_CMP_GET_INT_METHOD.invoke(cmp, key));
+            if (val instanceof Number num) return num.intValue();
+        }
+        return -1;
+    }
+
+    // ── Public APIs ──────────────────────────────────────────────────────────
 
     public String getPresetName(int index) {
         return (index == 1) ? preset1Name.get() : preset2Name.get();
@@ -645,7 +787,7 @@ public class Inventory101 extends Module {
         info("Restocking whitelisted items...");
     }
 
-    // ── Preview APIs (Middle-Click Open & Dominant Item Overlays) ──
+    // ── Preview APIs ──
 
     public void openPreview(ItemStack stack) {
         if (mc.player == null || stack.isEmpty()) return;
@@ -816,12 +958,46 @@ public class Inventory101 extends Module {
 
         this.drawingOverlay = true;
         try {
-            var matrices = context.getMatrices();
-            matrices.push();
-            matrices.translate(ox, oy, 200.0F);
-            matrices.scale(scale, scale, 1.0F);
-            context.drawItem(dominant, 0, 0);
-            matrices.pop();
+            Object matrices = context.getMatrices();
+            if (!MATRIX_REFLECTION_INIT) {
+                MATRIX_REFLECTION_INIT = true;
+                Class<?> mClass = matrices.getClass();
+                try {
+                    MATRIX_PUSH_METHOD      = mClass.getMethod("pushMatrix");
+                    MATRIX_POP_METHOD       = mClass.getMethod("popMatrix");
+                    MATRIX_TRANSLATE_METHOD = mClass.getMethod("translate", float.class, float.class);
+                    MATRIX_SCALE_METHOD     = mClass.getMethod("scale", float.class, float.class);
+                    MATRIX_IS_2D            = true;
+                } catch (NoSuchMethodException e) {
+                    for (String pushName : new String[]{"push", "method_22903"}) {
+                        try { MATRIX_PUSH_METHOD = mClass.getMethod(pushName); break; } catch (NoSuchMethodException ignored) {}
+                    }
+                    for (String popName : new String[]{"pop", "method_22909"}) {
+                        try { MATRIX_POP_METHOD = mClass.getMethod(popName); break; } catch (NoSuchMethodException ignored) {}
+                    }
+                    for (String transName : new String[]{"translate", "method_46416"}) {
+                        try { MATRIX_TRANSLATE_METHOD = mClass.getMethod(transName, float.class, float.class, float.class); break; } catch (NoSuchMethodException ignored) {}
+                    }
+                    for (String scaleName : new String[]{"scale", "method_22905"}) {
+                        try { MATRIX_SCALE_METHOD = mClass.getMethod(scaleName, float.class, float.class, float.class); break; } catch (NoSuchMethodException ignored) {}
+                    }
+                    MATRIX_IS_2D = false;
+                }
+            }
+
+            if (MATRIX_PUSH_METHOD != null && MATRIX_POP_METHOD != null) {
+                MATRIX_PUSH_METHOD.invoke(matrices);
+                if (MATRIX_IS_2D) {
+                    MATRIX_TRANSLATE_METHOD.invoke(matrices, (float) ox, (float) oy);
+                    MATRIX_SCALE_METHOD.invoke(matrices, scale, scale);
+                } else {
+                    MATRIX_TRANSLATE_METHOD.invoke(matrices, (float) ox, (float) oy, 200.0F);
+                    MATRIX_SCALE_METHOD.invoke(matrices, scale, scale, 1.0F);
+                }
+                context.drawItem(dominant, 0, 0);
+                MATRIX_POP_METHOD.invoke(matrices);
+            }
+        } catch (Exception ignored) {
         } finally {
             this.drawingOverlay = false;
         }
@@ -912,9 +1088,10 @@ public class Inventory101 extends Module {
                 BlockState state = mc.world.getBlockState(bhr.getBlockPos());
                 if (!state.isAir()) {
                     int bestSlot = findBestTool(state);
-                    if (bestSlot != -1 && bestSlot != mc.player.getInventory().selectedSlot) {
+                    int currentSlot = getSelectedSlot();
+                    if (bestSlot != -1 && bestSlot != currentSlot) {
                         if (!wasBreaking) {
-                            prevSlotAutoTool = mc.player.getInventory().selectedSlot;
+                            prevSlotAutoTool = currentSlot;
                             wasBreaking = true;
                         }
                         InvUtils.swap(bestSlot, silentAutoTool.get());
@@ -1413,11 +1590,26 @@ public class Inventory101 extends Module {
     private boolean performTrashStep() {
         if (mc.player.currentScreenHandler == null) return false;
         ScreenHandler handler = mc.player.currentScreenHandler;
-        int playerStart = handler.slots.size() - 36;
-        for (int i = playerStart; i < handler.slots.size(); i++) {
-            ItemStack stack = handler.getSlot(i).getStack();
+        for (Slot slot : handler.slots) {
+            if (slot.inventory == mc.player.getInventory()) {
+                int invIndex = slot.getIndex();
+                if (invIndex >= 0 && invIndex < 36) {
+                    ItemStack stack = slot.getStack();
+                    if (!stack.isEmpty() && trashItems.get().contains(stack.getItem())) {
+                        mc.interactionManager.clickSlot(handler.syncId, slot.id, 1, SlotActionType.THROW, mc.player);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasTrashInPlayerSlots() {
+        if (mc.player == null || trashItems.get().isEmpty()) return false;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
             if (!stack.isEmpty() && trashItems.get().contains(stack.getItem())) {
-                mc.interactionManager.clickSlot(handler.syncId, i, 1, SlotActionType.THROW, mc.player);
                 return true;
             }
         }
@@ -1450,26 +1642,49 @@ public class Inventory101 extends Module {
     }
 
     private void tickAutoTrash() {
-        if (autoTrash.get() && !isBusy()) {
-            if (isTrashing) {
-                if (trashTimer > 0) trashTimer--;
-                else if (performTrashStep()) trashTimer = trashDelay.get();
-                else isTrashing = false;
+        if (!autoTrash.get() || trashItems.get().isEmpty()) {
+            isTrashing = false;
+            return;
+        }
+
+        if (!(mc.currentScreen instanceof HandledScreen<?>)) {
+            isTrashing = false;
+            return;
+        }
+
+        if (isSorting || isReplenishing || isRegearing || isInvSorting) return;
+
+        if (!isTrashing && hasTrashInPlayerSlots()) {
+            isTrashing = true;
+            trashTimer = 0;
+        }
+
+        if (isTrashing) {
+            if (trashTimer > 0) {
+                trashTimer--;
+            } else if (performTrashStep()) {
+                trashTimer = trashDelay.get();
+            } else {
+                isTrashing = false;
             }
         }
     }
 
     private void tickAutoDrop() {
-        if (autoTrash.get() && mc.currentScreen == null) {
-            if (trashTimer > 0) { trashTimer--; }
-            else {
-                for (int i = 0; i < 36; i++) {
-                    ItemStack stack = mc.player.getInventory().getStack(i);
-                    if (!stack.isEmpty() && trashItems.get().contains(stack.getItem())) {
-                        InvUtils.drop().slot(i);
-                        trashTimer = trashDelay.get();
-                        break;
-                    }
+        if (!autoTrash.get() || trashItems.get().isEmpty()) return;
+
+        boolean canDropInCurrentScreen = (mc.currentScreen == null) || (mc.currentScreen instanceof ChatScreen);
+        if (!canDropInCurrentScreen) return;
+
+        if (trashTimer > 0) {
+            trashTimer--;
+        } else {
+            for (int i = 0; i < 36; i++) {
+                ItemStack stack = mc.player.getInventory().getStack(i);
+                if (!stack.isEmpty() && trashItems.get().contains(stack.getItem())) {
+                    InvUtils.drop().slot(i);
+                    trashTimer = trashDelay.get();
+                    break;
                 }
             }
         }
@@ -1512,18 +1727,21 @@ public class Inventory101 extends Module {
         for (int i = 0; i < PRESET_SIZE; i++) items.add(ItemStack.EMPTY);
         if (nbtString == null || nbtString.isEmpty()) return items;
         try {
-            NbtCompound nbt = StringNbtReader.parse(nbtString);
-            if (nbt.contains("Items", NbtElement.LIST_TYPE)) {
-                NbtList list = nbt.getList("Items", NbtElement.COMPOUND_TYPE);
-                for (int i = 0; i < list.size(); i++) {
-                    NbtCompound itemTag = list.getCompound(i);
-                    int slot = itemTag.getInt("Slot");
-                    NbtElement itemNbt = itemTag.get("item");
-                    if (slot < PRESET_SIZE && itemNbt != null) {
-                        ItemStack.CODEC
-                            .parse(RegistryOps.of(NbtOps.INSTANCE, mc.world.getRegistryManager()), itemNbt)
-                            .result()
-                            .ifPresent(s -> items.set(slot, s));
+            NbtCompound nbt = parseNbtCompoundCompat(nbtString);
+            if (nbt != null && nbt.contains("Items")) {
+                NbtList list = getNbtListCompat(nbt, "Items");
+                if (list != null) {
+                    for (int i = 0; i < list.size(); i++) {
+                        NbtCompound itemTag = getCompoundAtCompat(list, i);
+                        if (itemTag == null) continue;
+                        int slot = getIntCompat(itemTag, "Slot");
+                        NbtElement itemNbt = itemTag.get("item");
+                        if (slot >= 0 && slot < PRESET_SIZE && itemNbt != null) {
+                            ItemStack.CODEC
+                                .parse(RegistryOps.of(NbtOps.INSTANCE, mc.world.getRegistryManager()), itemNbt)
+                                .result()
+                                .ifPresent(s -> items.set(slot, s));
+                        }
                     }
                 }
             }
@@ -1627,7 +1845,7 @@ public class Inventory101 extends Module {
         private int getColorId(ItemStack stack) {
             if (stack.getItem() instanceof BlockItem bi && bi.getBlock() instanceof ShulkerBoxBlock sb) {
                 DyeColor c = sb.getColor();
-                return c == null ? 16 : c.getId();
+                return c == null ? 16 : c.ordinal();
             }
             return 17;
         }

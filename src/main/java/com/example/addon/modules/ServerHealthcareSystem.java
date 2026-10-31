@@ -1,5 +1,7 @@
 package com.example.addon.modules;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Random;
 import java.util.Set;
 
@@ -29,6 +31,7 @@ import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.BedBlock;
 import net.minecraft.block.BlockState;
+import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.AttributeModifiersComponent;
@@ -38,10 +41,10 @@ import net.minecraft.enchantment.Enchantment;
 import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.PlayerInteractItemC2SPacket;
 import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.entry.RegistryEntry;
@@ -49,7 +52,6 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3d;
 
 public class ServerHealthcareSystem extends Module {
 
@@ -322,13 +324,13 @@ public class ServerHealthcareSystem extends Module {
         .description("Hotkey to automatically break the nearest bed when in Quick Respawn mode.")
         .defaultValue(Keybind.none())
         .action(() -> {
-            if (mc.currentScreen != null) return;
+            if (mc.currentScreen != null || mc.player == null) return;
             if (mode.get() == OperationMode.QuickRespawn) {
                 BlockPos nearest = findNearestBed();
                 if (nearest != null) {
                     bedToBreak = nearest;
                     breakTickCounter = 0;
-                    bedOriginalHotbarSlot = mc.player.getInventory().selectedSlot;
+                    bedOriginalHotbarSlot = getSelectedSlot();
                     info("Initiating bed breaking at %s...", nearest.toShortString());
                 } else {
                     warning("No bed found nearby to break.");
@@ -358,14 +360,15 @@ public class ServerHealthcareSystem extends Module {
     private int     moveWaitTicks         = 0;
 
     // Auto Break Bed
-    private BlockPos bedToBreak = null;
-    private int breakTickCounter = 0;
-    private int bedOriginalHotbarSlot = -1;
+    private BlockPos bedToBreak            = null;
+    private int      breakTickCounter      = 0;
+    private int      bedOriginalHotbarSlot = -1;
 
     // Smart Chestplate
-    private long    lastSwapTime      = 0;
-    private long    jumpTime          = -1;
-    private boolean wasOnGround       = true;
+    private long    lastSwapTime        = 0;
+    private long    jumpTime            = -1;
+    private boolean wasOnGround         = true;
+    private double  lastPlayerY         = Double.NaN;
     private boolean manualSwapRequested = false;
 
     // Anti-AFK (always on while module is active)
@@ -373,6 +376,11 @@ public class ServerHealthcareSystem extends Module {
     private int antiAfkNextSwingTicks = 0;
     private int lastSwingDelayTicks   = -1;
     private static final Random AFK_RANDOM = new Random();
+
+    // Cross-Version Reflection Cache (1.21.4 vs 1.21.5 / 1.21.8 / 1.21.11)
+    private static Method GET_SELECTED_SLOT_METHOD = null;
+    private static Field  SELECTED_SLOT_FIELD      = null;
+    private static boolean SLOT_REFLECTION_INIT    = false;
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -395,6 +403,7 @@ public class ServerHealthcareSystem extends Module {
         if (mc.player != null) {
             lastHealth = mc.player.getHealth();
             highestHungerSeen = mc.player.getHungerManager().getFoodLevel();
+            lastPlayerY = mc.player.getY();
         }
         resetState();
 
@@ -420,6 +429,7 @@ public class ServerHealthcareSystem extends Module {
         if (mc.player != null) {
             lastHealth = mc.player.getHealth();
             highestHungerSeen = mc.player.getHungerManager().getFoodLevel();
+            lastPlayerY = mc.player.getY();
         }
         resetState();
         if (autoTotem.get()) tickAutoTotem();
@@ -430,6 +440,58 @@ public class ServerHealthcareSystem extends Module {
     public boolean isAutoTotemEnabled() { return isActive() && autoTotem.get(); }
     public void setAutoTotem(boolean enabled) { autoTotem.set(enabled); }
     public boolean isEating() { return isEating || moveWaitTicks > 0; }
+
+    // ── Cross-Version Helpers (1.21.4 - 1.21.11) ──────────────────────────────
+
+    /**
+     * Safely reads the selected hotbar slot across 1.21.4 (public field)
+     * and 1.21.5 / 1.21.8 / 1.21.11 (getSelectedSlot() getter).
+     */
+    private int getSelectedSlot() {
+        if (mc.player == null) return 0;
+        PlayerInventory inv = mc.player.getInventory();
+
+        if (!SLOT_REFLECTION_INIT) {
+            SLOT_REFLECTION_INIT = true;
+            try {
+                // 1.21.5, 1.21.8, 1.21.11 (Yarn & Mojmap)
+                GET_SELECTED_SLOT_METHOD = PlayerInventory.class.getMethod("getSelectedSlot");
+            } catch (NoSuchMethodException e1) {
+                try {
+                    // Fabric Intermediary fallback for getSelectedSlot() in 1.21.5+
+                    GET_SELECTED_SLOT_METHOD = PlayerInventory.class.getMethod("method_67532");
+                } catch (NoSuchMethodException ignored) {}
+            }
+
+            if (GET_SELECTED_SLOT_METHOD == null) {
+                for (String fieldName : new String[]{"selectedSlot", "field_7545"}) {
+                    try {
+                        Field f = PlayerInventory.class.getDeclaredField(fieldName);
+                        f.setAccessible(true);
+                        SELECTED_SLOT_FIELD = f;
+                        break;
+                    } catch (NoSuchFieldException ignored) {}
+                }
+            }
+        }
+
+        try {
+            if (GET_SELECTED_SLOT_METHOD != null) {
+                return (int) GET_SELECTED_SLOT_METHOD.invoke(inv);
+            } else if (SELECTED_SLOT_FIELD != null) {
+                return SELECTED_SLOT_FIELD.getInt(inv);
+            }
+        } catch (Exception ignored) {}
+
+        return 0;
+    }
+
+    private void selectHotbarSlot(int slot) {
+        if (mc.player == null || slot < 0 || slot > 8) return;
+        if (getSelectedSlot() != slot) {
+            InvUtils.swap(slot, false);
+        }
+    }
 
     // ── State Helpers ─────────────────────────────────────────────────────────
 
@@ -448,11 +510,12 @@ public class ServerHealthcareSystem extends Module {
         bedOriginalHotbarSlot = -1;
         highestHungerSeen     = -1;
         moveWaitTicks         = 0;
-        
+
         // Smart Chestplate resets
-        lastSwapTime = 0;
-        jumpTime = -1;
-        wasOnGround = true;
+        lastSwapTime        = 0;
+        jumpTime            = -1;
+        wasOnGround         = true;
+        lastPlayerY         = mc.player != null ? mc.player.getY() : Double.NaN;
         manualSwapRequested = false;
 
         // Anti-AFK resets
@@ -463,6 +526,9 @@ public class ServerHealthcareSystem extends Module {
 
     private void stopEating() {
         mc.options.useKey.setPressed(false);
+        if (mc.interactionManager != null && mc.player != null && mc.player.isUsingItem()) {
+            mc.interactionManager.stopUsingItem(mc.player);
+        }
         isEating              = false;
         eatHotbarSlot         = -1;
         eatOriginalHotbarSlot = -1;
@@ -474,6 +540,9 @@ public class ServerHealthcareSystem extends Module {
 
     private void finishEating() {
         mc.options.useKey.setPressed(false);
+        if (mc.interactionManager != null && mc.player != null && mc.player.isUsingItem()) {
+            mc.interactionManager.stopUsingItem(mc.player);
+        }
 
         if (swapBack.get() && eatOriginalHotbarSlot != -1 && eatOriginalHotbarSlot != eatHotbarSlot) {
             InvUtils.swap(eatOriginalHotbarSlot, false);
@@ -489,17 +558,18 @@ public class ServerHealthcareSystem extends Module {
         highestHungerSeen     = -1;
     }
 
-    private void sendUseItemPacket() {
-        if (mc.player == null) return;
-        mc.player.networkHandler.sendPacket(
-            new PlayerInteractItemC2SPacket(
-                Hand.MAIN_HAND,
-                mc.player.currentScreenHandler.getRevision(),
-                mc.player.getYaw(),
-                mc.player.getPitch()
-            )
-        );
-        mc.player.swingHand(Hand.MAIN_HAND);
+    /**
+     * Initiates item use on both client and server so that eating works
+     * even when ChatScreen is open (where vanilla suppresses handleInputEvents).
+     */
+    private void startEatingItem() {
+        if (mc.player == null || mc.interactionManager == null) return;
+        mc.options.useKey.setPressed(true);
+        mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
+    }
+
+    private boolean isDisallowedScreenOpen() {
+        return mc.currentScreen != null && !(mc.currentScreen instanceof ChatScreen);
     }
 
     // ── Tick ──────────────────────────────────────────────────────────────────
@@ -522,6 +592,7 @@ public class ServerHealthcareSystem extends Module {
             }
             case QuickRespawn -> {
                 tickAutoRespawn();
+                tickQuickRespawnMode();
                 tickAutoEat();
                 tickHealthTracking();
             }
@@ -534,20 +605,12 @@ public class ServerHealthcareSystem extends Module {
         antiAfkTickCounter++;
 
         if (antiAfkTickCounter >= antiAfkNextSwingTicks) {
-            // Swing the hand — this sends HandSwingC2SPacket, which most
-            // servers count as activity and prevents AFK kicks.
             mc.player.swingHand(Hand.MAIN_HAND);
-
-            // Reset counter and schedule next swing (never same as previous)
             antiAfkTickCounter    = 0;
             antiAfkNextSwingTicks = generateAntiAfkDelay();
         }
     }
 
-    /**
-     * Generates a random anti-AFK swing delay between 10s (200t) and 35s (700t).
-     * Guarantees the same value is never returned twice in a row.
-     */
     private int generateAntiAfkDelay() {
         int delay;
         do {
@@ -606,7 +669,7 @@ public class ServerHealthcareSystem extends Module {
                 return;
             }
 
-            if (mc.player.getPos().distanceTo(Vec3d.ofCenter(bedToBreak)) > 6.0) {
+            if (mc.player.getBlockPos().getSquaredDistance(bedToBreak) > 36.0) {
                 warning("Too far from bed, stopping breaking.");
                 bedToBreak = null;
                 if (bedOriginalHotbarSlot != -1) {
@@ -618,9 +681,9 @@ public class ServerHealthcareSystem extends Module {
 
             int bestToolSlot = findBestTool(bedToBreak);
 
-            if (bestToolSlot != -1 && mc.player.getInventory().selectedSlot != bestToolSlot) {
+            if (bestToolSlot != -1 && getSelectedSlot() != bestToolSlot) {
                 if (bedOriginalHotbarSlot == -1) {
-                    bedOriginalHotbarSlot = mc.player.getInventory().selectedSlot;
+                    bedOriginalHotbarSlot = getSelectedSlot();
                 }
                 InvUtils.swap(bestToolSlot, false);
             }
@@ -656,7 +719,6 @@ public class ServerHealthcareSystem extends Module {
 
             if (ignoredArmorSlot.get() == IgnoredArmorSlot.All) continue;
             if (slot == EquipmentSlot.HEAD && ignoredArmorSlot.get() == IgnoredArmorSlot.Helmet) continue;
-            // Skip chestplate handling if set to Smart to prevent override conflicts
             if (slot == EquipmentSlot.CHEST && (ignoredArmorSlot.get() == IgnoredArmorSlot.Chestplate || chestplateMode.get() == ChestplateMode.Smart)) continue;
             if (slot == EquipmentSlot.LEGS && ignoredArmorSlot.get() == IgnoredArmorSlot.Leggings) continue;
             if (slot == EquipmentSlot.FEET && ignoredArmorSlot.get() == IgnoredArmorSlot.Boots) continue;
@@ -695,11 +757,17 @@ public class ServerHealthcareSystem extends Module {
 
         long now = System.currentTimeMillis();
         boolean onGround = mc.player.isOnGround();
+        double currentY = mc.player.getY();
+
+        if (Double.isNaN(lastPlayerY)) {
+            lastPlayerY = currentY;
+        }
 
         // Detect jump (transition from ground to air while moving up)
-        if (wasOnGround && !onGround && mc.player.getY() > mc.player.prevY + 0.1) {
+        if (wasOnGround && !onGround && currentY > lastPlayerY + 0.1) {
             jumpTime = now;
         }
+        lastPlayerY = currentY;
 
         // Cancel pending elytra swap if we landed quickly
         if (onGround && jumpTime != -1 && (now - jumpTime) < jumpDelayMs.get()) {
@@ -727,13 +795,11 @@ public class ServerHealthcareSystem extends Module {
         // Swap to ELYTRA conditions
         boolean shouldElytra = false;
 
-        // Jump + delay expired (still in air)
         if (jumpTime != -1 && (now - jumpTime) >= jumpDelayMs.get() && !onGround) {
             shouldElytra = true;
             jumpTime = -1;
         }
 
-        // Fall distance backup trigger
         if (fallDistanceTrigger.get() > 0 && mc.player.fallDistance >= fallDistanceTrigger.get()) {
             shouldElytra = true;
         }
@@ -790,6 +856,12 @@ public class ServerHealthcareSystem extends Module {
     private void tickAutoEat() {
         if (!autoEat.get()) return;
 
+        // Do not eat if a non-chat GUI screen (like an inventory or chest) is open
+        if (isDisallowedScreenOpen()) {
+            if (isEating || moveWaitTicks > 0) finishEating();
+            return;
+        }
+
         if (eatCooldownTimer > 0) {
             eatCooldownTimer--;
             return;
@@ -800,11 +872,10 @@ public class ServerHealthcareSystem extends Module {
             if (moveWaitTicks == 0) {
                 ItemStack hotbarStack = mc.player.getInventory().getStack(eatHotbarSlot);
                 if (eatTargetItem != null && hotbarStack.isOf(eatTargetItem)) {
-                    mc.player.getInventory().selectedSlot = eatHotbarSlot;
+                    selectHotbarSlot(eatHotbarSlot);
                     eatTicksRemaining = hotbarStack.getItem().getMaxUseTime(hotbarStack, mc.player);
                     eatStartupTicks = 3;
-                    mc.options.useKey.setPressed(true);
-                    sendUseItemPacket();
+                    startEatingItem();
                     isEating = true;
                 } else {
                     stopEating();
@@ -845,15 +916,14 @@ public class ServerHealthcareSystem extends Module {
                 }
             }
 
-            eatOriginalHotbarSlot = mc.player.getInventory().selectedSlot;
+            eatOriginalHotbarSlot = getSelectedSlot();
 
             if (foodSlot < 9) {
                 eatHotbarSlot = foodSlot;
-                mc.player.getInventory().selectedSlot = eatHotbarSlot;
+                selectHotbarSlot(eatHotbarSlot);
                 eatTicksRemaining = foodStack.getItem().getMaxUseTime(foodStack, mc.player);
                 eatStartupTicks = 3;
-                mc.options.useKey.setPressed(true);
-                sendUseItemPacket();
+                startEatingItem();
                 isEating = true;
             } else {
                 eatHotbarSlot = findEmptyHotbarSlot();
@@ -868,10 +938,16 @@ public class ServerHealthcareSystem extends Module {
             }
 
         } else {
+            // Keep useKey pressed every tick so opening ChatScreen mid-meal
+            // (which calls KeyBinding.unpressAll()) doesn't abort item usage.
+            selectHotbarSlot(eatHotbarSlot);
+            mc.options.useKey.setPressed(true);
+
             if (eatStartupTicks > 0) {
                 eatStartupTicks--;
-                mc.player.getInventory().selectedSlot = eatHotbarSlot;
-                mc.options.useKey.setPressed(true);
+                if (!mc.player.isUsingItem()) {
+                    startEatingItem();
+                }
                 if (eatTicksRemaining > 0) eatTicksRemaining--;
                 return;
             }
@@ -884,16 +960,8 @@ public class ServerHealthcareSystem extends Module {
                 return;
             }
 
-            if (mc.currentScreen != null) {
-                finishEating();
-                return;
-            }
-
-            mc.player.getInventory().selectedSlot = eatHotbarSlot;
-            mc.options.useKey.setPressed(true);
-
-            if (!mc.player.isUsingItem() && hotbarHasFood) {
-                sendUseItemPacket();
+            if (!mc.player.isUsingItem()) {
+                startEatingItem();
                 eatTicksRemaining = hotbarStack.getItem().getMaxUseTime(hotbarStack, mc.player);
                 return;
             }
@@ -1059,8 +1127,8 @@ public class ServerHealthcareSystem extends Module {
                 if (keyOpt == null || keyOpt.isEmpty()) continue;
                 String id = keyOpt.get().getValue().toString();
                 double v  = entry.modifier().value();
-                if      (id.equals("minecraft:generic.armor"))           armor     += v;
-                else if (id.equals("minecraft:generic.armor_toughness")) toughness += v;
+                if      (id.equals("minecraft:generic.armor") || id.equals("minecraft:armor"))                     armor     += v;
+                else if (id.equals("minecraft:generic.armor_toughness") || id.equals("minecraft:armor_toughness")) toughness += v;
             }
         }
 
@@ -1075,11 +1143,14 @@ public class ServerHealthcareSystem extends Module {
     private int countTotems() {
         if (mc.player == null) return 0;
         int count = 0;
-        for (ItemStack stack : mc.player.getInventory().main) {
+        // Compatible across 1.21.4 - 1.21.11 (avoids private PlayerInventory.main in 1.21.5+)
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
             if (stack.isOf(Items.TOTEM_OF_UNDYING)) count += stack.getCount();
         }
-        if (mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING))
+        if (mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) {
             count += mc.player.getOffHandStack().getCount();
+        }
         return count;
     }
 

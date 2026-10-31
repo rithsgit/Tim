@@ -1,8 +1,10 @@
 package com.example.addon.modules;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -43,6 +45,7 @@ import net.minecraft.client.render.Camera;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.network.packet.s2c.play.BlockUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.ChunkDeltaUpdateS2CPacket;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
@@ -58,12 +61,6 @@ import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.chunk.WorldChunk;
-import xaeroplus.module.ModuleManager;
-import xaeroplus.module.impl.LiquidNewChunks;
-import xaeroplus.module.impl.OldChunks;
-import xaeroplus.module.impl.PaletteNewChunks;
-import xaeroplus.module.impl.PortalSkipDetection;
-import xaeroplus.settings.Settings;
 
 public class Skipper extends Module {
 
@@ -76,6 +73,13 @@ public class Skipper extends Module {
         ERA_MIXED_1_12_TRAIL,
         ERA_1_19_TRAIL,
         ERA_1_19_FRESH
+    }
+
+    public enum TrackingFocus {
+        ALL,
+        PURE_1_12,
+        PURE_1_19,
+        MIXED
     }
 
     public enum RenderMode {
@@ -104,31 +108,16 @@ public class Skipper extends Module {
 
     private static final int PORTAL_SEARCH_RETRY_TICKS = 20;
     private static final int MAX_ALTERNATIVE_PORTAL_PREVIEWS = 4;
-    private static final long LAVA_SETTLE_QUIET_NANOS = 2_000_000_000L;
+    private static final long LAVA_SETTLE_QUIET_NANOS = 3_000_000_000L;
     private static final int MAX_PENDING_CHUNK_SCANS_PER_TICK = 4;
     private static final long CHUNK_SCAN_BUDGET_NANOS = 5_000_000L;
-
-    private static final class PortalScanStats {
-        private int highlightCount;
-        private int denseCandidateCount;
-        private int incompleteTrailWidthRejections;
-        private int flowingLavaRejections;
-        private int unsettledLavaRejections;
-        private int candidatesTried;
-        private int nearbyPortalRejections;
-        private int noSafeSiteRejections;
-        private int positionsChecked;
-        private int siteChecks;
-        private int worldChecks;
-        private long siteSearchNanos;
-    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Setting Groups & Settings
     // ═══════════════════════════════════════════════════════════════════════════
 
     private final SettingGroup sgGeneral    = settings.getDefaultGroup();
-    private final SettingGroup sgEra        = settings.createGroup("Era Classification (1.12 vs 1.19)");
+    private final SettingGroup sgEra        = settings.createGroup("Era Classification & Tracking Focus");
     private final SettingGroup sgPortalSkip = settings.createGroup("Portal Skips");
     private final SettingGroup sgAlerts     = settings.createGroup("Alerts & Notifications");
     private final SettingGroup sgLava       = settings.createGroup("Lava Marker & Flow");
@@ -139,6 +128,12 @@ public class Skipper extends Module {
     private final Setting<Boolean> syncWithXaeroPlus = sgGeneral.add(new BoolSetting.Builder()
         .name("sync-xaeroplus").defaultValue(true).build()
     );
+    private final Setting<Boolean> nativeXaeroMapCoexistence = sgGeneral.add(new BoolSetting.Builder()
+        .name("xaero-map-coexistence")
+        .description("Lets XaeroPlus natively render chunk trails and portal skips on the Minimap and World Map without Skipper painting over them.")
+        .defaultValue(true)
+        .build()
+    );
     private final Setting<Keybind> dismissNearestKey = sgGeneral.add(new KeybindSetting.Builder()
         .name("dismiss-nearest-key")
         .description("Dismisses the closest active portal preview.")
@@ -146,7 +141,13 @@ public class Skipper extends Module {
         .build()
     );
 
-    // Era Classification
+    // Era Classification & Tracking Focus
+    private final Setting<TrackingFocus> trackingFocus = sgEra.add(new EnumSetting.Builder<TrackingFocus>()
+        .name("tracking-focus")
+        .description("Adapts trail, portal, and lava filters for 1.12, 1.19+, mixed, or all trails.")
+        .defaultValue(TrackingFocus.ALL)
+        .build()
+    );
     private final Setting<Boolean> classify112Blocks = sgEra.add(new BoolSetting.Builder()
         .name("classify-1.12-old-chunks").defaultValue(true).build()
     );
@@ -311,10 +312,9 @@ public class Skipper extends Module {
 
     private String lastDimension = "";
     private boolean xaeroPlusSyncedToNether;
-    private boolean portalDetectionEnabledBySkipper;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Lifecycle
+    // Lifecycle & Multi-Version Helpers
     // ═══════════════════════════════════════════════════════════════════════════
 
     public Skipper() {
@@ -331,14 +331,13 @@ public class Skipper extends Module {
             refreshLoadedChunks();
         }
         if (syncWithXaeroPlus.get()) syncToXaeroPlus(isNether());
-        syncPortalSkipDetection(isNether() && portalSkipEnabled.get());
+        syncPortalSkipDetection(portalSkipEnabled.get());
     }
 
     @Override
     public void onDeactivate() {
         clearData();
         lastDimension = "";
-        syncPortalSkipDetection(false);
         if (syncWithXaeroPlus.get()) syncToXaeroPlus(false);
     }
 
@@ -367,6 +366,24 @@ public class Skipper extends Module {
 
     private boolean isNether() {
         return mc.world != null && mc.world.getRegistryKey().equals(World.NETHER);
+    }
+
+    private static double squaredDistanceTo(BlockPos pos, double x, double y, double z) {
+        double dx = (pos.getX() + 0.5) - x;
+        double dy = (pos.getY() + 0.5) - y;
+        double dz = (pos.getZ() + 0.5) - z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static double squaredDistanceBetween(BlockPos a, BlockPos b) {
+        double dx = a.getX() - b.getX();
+        double dy = a.getY() - b.getY();
+        double dz = a.getZ() - b.getZ();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static int getChunkChebyshevDistance(ChunkPos a, ChunkPos b) {
+        return Math.max(Math.abs(a.x - b.x), Math.abs(a.z - b.z));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -502,11 +519,8 @@ public class Skipper extends Module {
             return;
         }
 
-        // Handle Manual Keybind Actions
-        if (mc.currentScreen == null) {
-            if (dismissNearestKey.get().isPressed()) {
-                dismissNearestPortalPreview();
-            }
+        if (mc.currentScreen == null && dismissNearestKey.get().isPressed()) {
+            dismissNearestPortalPreview();
         }
 
         processPendingChunkScans();
@@ -518,22 +532,27 @@ public class Skipper extends Module {
 
         tickAlternativePortalPreviews();
         detectCompletedPortalPreview();
+
+        // Continuously validate active portal preview every 10 ticks so if lava
+        // starts flowing in or near the trail, the preview is immediately removed!
         if (activePreviewValidationTicksRemaining > 0) {
             activePreviewValidationTicksRemaining--;
         } else if (!portalPreviews.isEmpty()) {
-            activePreviewValidationTicksRemaining = 20;
+            activePreviewValidationTicksRemaining = 10;
             validateActivePortalPreview();
         }
 
         if (alertsEnabled.get() && mc.player != null) {
-            double thresholdSq = Math.pow(proximityDistance.get(), 2);
+            double thresholdSq = (double) proximityDistance.get() * proximityDistance.get();
+            BlockPos playerBlockPos = mc.player.getBlockPos();
             for (Map.Entry<Long, PortalPreview> entry : portalPreviews.entrySet()) {
                 long key = entry.getKey();
                 if (proximityAlertedPreviews.contains(key)) continue;
                 BlockPos base = entry.getValue().site().base();
-                if (mc.player.getBlockPos().getSquaredDistance(base) <= thresholdSq) {
+                double distSq = squaredDistanceBetween(playerBlockPos, base);
+                if (distSq <= thresholdSq) {
                     proximityAlertedPreviews.add(key);
-                    int blocksAway = (int) Math.sqrt(mc.player.getBlockPos().getSquaredDistance(base));
+                    int blocksAway = (int) Math.sqrt(distSq);
                     try {
                         mc.inGameHud.getChatHud().addMessage(
                             Text.literal("§6[Skipper] §ePotential portal skip detected approximately §b" + blocksAway + " blocks away§e!")
@@ -587,23 +606,23 @@ public class Skipper extends Module {
         
         long nearestKey = -1;
         double minDistanceSq = Double.MAX_VALUE;
-        Vec3d playerPos = mc.player.getPos();
+        double px = mc.player.getX();
+        double py = mc.player.getY();
+        double pz = mc.player.getZ();
 
-        for (Long key : portalPreviews.keySet()) {
-            PortalPreview preview = portalPreviews.get(key);
-            double distSq = preview.site().base().getSquaredDistance(playerPos.x, playerPos.y, playerPos.z);
+        for (Map.Entry<Long, PortalPreview> entry : portalPreviews.entrySet()) {
+            double distSq = squaredDistanceTo(entry.getValue().site().base(), px, py, pz);
             if (distSq < minDistanceSq) {
                 minDistanceSq = distSq;
-                nearestKey = key;
+                nearestKey = entry.getKey();
             }
         }
 
-        for (Long key : alternativePortalPreviews.keySet()) {
-            PortalPreview preview = alternativePortalPreviews.get(key).preview();
-            double distSq = preview.site().base().getSquaredDistance(playerPos.x, playerPos.y, playerPos.z);
+        for (Map.Entry<Long, TimedPortalPreview> entry : alternativePortalPreviews.entrySet()) {
+            double distSq = squaredDistanceTo(entry.getValue().preview().site().base(), px, py, pz);
             if (distSq < minDistanceSq) {
                 minDistanceSq = distSq;
-                nearestKey = key;
+                nearestKey = entry.getKey();
             }
         }
 
@@ -633,7 +652,7 @@ public class Skipper extends Module {
             alternativePreviewValidationTicksRemaining--;
             return;
         }
-        alternativePreviewValidationTicksRemaining = 20;
+        alternativePreviewValidationTicksRemaining = 10;
 
         alternativePortalPreviews.entrySet().removeIf(entry -> isPortalPreviewUnsafe(entry.getKey(), entry.getValue().preview()));
     }
@@ -646,24 +665,26 @@ public class Skipper extends Module {
         int startOffset = -(width / 2);
         for (int xOffset = startOffset; xOffset < startOffset + width; xOffset++) {
             for (int zOffset = startOffset; zOffset < startOffset + width; zOffset++) {
-                if (hasLoadedTrailChunkWithFlow(centerX + xOffset, centerZ + zOffset, now)) {
+                if (hasTrailChunkFlowOrUnloaded(centerX + xOffset, centerZ + zOffset, now)) {
                     return true;
                 }
             }
         }
 
         if (findNearbyPortal(previewKey) != null) return true;
-        if (!isPortalSiteLoaded(preview.site())) return false;
-        return !isLavaSafePortalSite(preview.site().base(), preview.site().axis(), new PortalScanStats());
+        if (!isPortalSiteLoaded(preview.site())) return true;
+        return !isLavaSafePortalSite(preview.site().base(), preview.site().axis());
     }
 
-    private boolean hasLoadedTrailChunkWithFlow(int chunkX, int chunkZ, long now) {
+    private boolean hasTrailChunkFlowOrUnloaded(int chunkX, int chunkZ, long now) {
         long chunkKey = ChunkPos.toLong(chunkX, chunkZ);
-        if (!mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)) return false;
+        if (!mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)) return true;
         long lastFlowUpdate = lastFlowingLavaUpdateNanos.getOrDefault(chunkKey, 0L);
         if (lastFlowUpdate > 0 && now - lastFlowUpdate < LAVA_SETTLE_QUIET_NANOS) return true;
 
         WorldChunk chunk = mc.world.getChunk(chunkX, chunkZ);
+        if (lavaFallsByChunk.containsKey(chunk.getPos())) return true;
+
         for (ChunkSection section : chunk.getSectionArray()) {
             if (section == null || section.isEmpty()) continue;
             if (section.hasAny(blockState -> {
@@ -691,6 +712,10 @@ public class Skipper extends Module {
         if (fluid.isIn(FluidTags.LAVA) && !fluid.isStill()) {
             long chunkKey = ChunkPos.toLong(pos.getX() >> 4, pos.getZ() >> 4);
             lastFlowingLavaUpdateNanos.put(chunkKey, System.nanoTime());
+            // Immediately invalidate any active preview if lava flows within its radius
+            if (!portalPreviews.isEmpty()) {
+                activePreviewValidationTicksRemaining = 0;
+            }
         }
     }
 
@@ -730,6 +755,21 @@ public class Skipper extends Module {
 
         boolean isXaeroPaletteNew = useXaeroPaletteNewChunks.get() && isXaeroPaletteNewChunk(cpos.x, cpos.z);
         boolean isXaeroOld = isXaeroOldChunk(cpos.x, cpos.z);
+        boolean isXaeroLiquidNew = isXaeroLiquidNewChunk(cpos.x, cpos.z);
+
+        if (isXaeroLiquidNew) {
+            liquidNewChunks.add(key);
+        }
+
+        if ((classify112Blocks.get() && hasNetherTerrain && !has116Blocks) || isXaeroOld) {
+            oldChunks112.add(key);
+            if (isXaeroPaletteNew || isXaeroLiquidNew) {
+                paletteNewChunks119.add(key);
+            } else {
+                paletteNewChunks119.remove(key);
+            }
+            return;
+        }
 
         if (has116Blocks || isXaeroPaletteNew) {
             paletteNewChunks119.add(key);
@@ -737,18 +777,16 @@ public class Skipper extends Module {
             return;
         }
 
-        if ((classify112Blocks.get() && hasNetherTerrain && !has116Blocks) || isXaeroOld) {
-            oldChunks112.add(key);
-            return;
-        }
-
         oldChunks112.remove(key);
     }
 
     public TrailEra getChunkEra(long chunkKey) {
-        boolean is112 = oldChunks112.contains(chunkKey);
-        boolean isReloaded119 = (useXaeroPaletteNewChunks.get() && isXaeroPaletteNewChunk(ChunkPos.getPackedX(chunkKey), ChunkPos.getPackedZ(chunkKey)))
+        int cx = ChunkPos.getPackedX(chunkKey);
+        int cz = ChunkPos.getPackedZ(chunkKey);
+        boolean is112 = oldChunks112.contains(chunkKey) || isXaeroOldChunk(cx, cz);
+        boolean isReloaded119 = (useXaeroPaletteNewChunks.get() && isXaeroPaletteNewChunk(cx, cz))
             || liquidNewChunks.contains(chunkKey)
+            || isXaeroLiquidNewChunk(cx, cz)
             || paletteNewChunks119.contains(chunkKey);
 
         if (is112 && isReloaded119) return TrailEra.ERA_MIXED_1_12_TRAIL;
@@ -757,40 +795,40 @@ public class Skipper extends Module {
         return TrailEra.ERA_1_19_TRAIL;
     }
 
-    public int measureTrailThickness(int centerChunkX, int centerChunkZ, boolean horizontalAxis) {
-        int thickness = 0;
-        int maxSearchRange = 24; 
-        
-        for (int i = -maxSearchRange; i <= maxSearchRange; i++) {
-            int checkX = centerChunkX + (horizontalAxis ? i : 0);
-            int checkZ = centerChunkZ + (horizontalAxis ? 0 : i);
-            long chunkKey = ChunkPos.toLong(checkX, checkZ);
-            
-            if (oldChunks112.contains(chunkKey) || paletteNewChunks119.contains(chunkKey) || liquidNewChunks.contains(chunkKey)) {
-                thickness++;
-            } else {
-                if (thickness > 0 && i > 0) break; 
-            }
-        }
-        return thickness;
+    /**
+     * Determines if a chunk era should be filtered out based on the user's TrackingFocus.
+     * In ALL mode, no eras are skipped so lava columns highlight on both 1.12 and 1.19+ trails!
+     */
+    public boolean shouldSkipEra(TrailEra era) {
+        return switch (trackingFocus.get()) {
+            case PURE_1_12 -> era != TrailEra.ERA_1_12 && era != TrailEra.ERA_MIXED_1_12_TRAIL;
+            case PURE_1_19 -> era != TrailEra.ERA_1_19_FRESH && era != TrailEra.ERA_1_19_TRAIL;
+            case MIXED -> era != TrailEra.ERA_MIXED_1_12_TRAIL && era != TrailEra.ERA_1_12;
+            case ALL -> false;
+        };
     }
 
     private TrailEra detectClusterEra(long centerChunkKey) {
         int cx = ChunkPos.getPackedX(centerChunkKey);
         int cz = ChunkPos.getPackedZ(centerChunkKey);
+        boolean seen112 = false;
+        boolean seen119 = false;
         for (int dx = -1; dx <= 1; dx++) {
             for (int dz = -1; dz <= 1; dz++) {
-                if (oldChunks112.contains(ChunkPos.toLong(cx + dx, cz + dz))) {
-                    return TrailEra.ERA_1_12;
-                }
+                TrailEra e = getChunkEra(ChunkPos.toLong(cx + dx, cz + dz));
+                if (e == TrailEra.ERA_MIXED_1_12_TRAIL) return TrailEra.ERA_MIXED_1_12_TRAIL;
+                if (e == TrailEra.ERA_1_12) seen112 = true;
+                if (e == TrailEra.ERA_1_19_FRESH || e == TrailEra.ERA_1_19_TRAIL) seen119 = true;
             }
         }
+        if (seen112 && seen119) return TrailEra.ERA_MIXED_1_12_TRAIL;
+        if (seen112) return TrailEra.ERA_1_12;
         return TrailEra.ERA_1_19_TRAIL;
     }
 
     private void scanPortalSkipCandidates() {
-        PortalSkipDetection detector = getPortalSkipDetection();
-        if (detector == null || !detector.isEnabled()) {
+        Object detector = getPortalSkipDetectionModule();
+        if (detector == null || !isXaeroModuleEnabled(detector)) {
             portalPreviews.clear();
             alternativePortalPreviews.clear();
             activePortalSkipKey = null;
@@ -823,25 +861,28 @@ public class Skipper extends Module {
             if (completedPortalSkips.contains(key)) continue;
             int cx = ChunkPos.getPackedX(key);
             int cz = ChunkPos.getPackedZ(key);
-            
-            int measuredWidthX = measureTrailThickness(cx, cz, true);
-            int measuredWidthZ = measureTrailThickness(cx, cz, false);
-            int effectiveWidth = Math.max(measuredWidthX, measuredWidthZ);
 
-            if (hasFullPortalTrailWidth(cx, cz, requiredTrailWidth, currentHighlights) || effectiveWidth >= requiredTrailWidth) {
-                candidates.add(key);
+            // Strictly require the full portal trail width of highlight chunks around (cx, cz).
+            // This prevents portal suggestions from spawning on the side edges of a trail!
+            if (hasFullPortalTrailWidth(cx, cz, requiredTrailWidth, currentHighlights)) {
+                TrailEra clusterEra = detectClusterEra(key);
+                if (!shouldSkipEra(clusterEra)) {
+                    candidates.add(key);
+                }
             }
         }
 
         Vec3d lookVec = mc.player.getRotationVector();
-        Vec3d playerPos = mc.player.getPos();
+        double px = mc.player.getX();
+        double py = mc.player.getY();
+        double pz = mc.player.getZ();
 
         candidates.sort((k1, k2) -> {
-            BlockPos site1 = new BlockPos(ChunkPos.getPackedX(k1) * 16 + 8, (int) playerPos.getY(), ChunkPos.getPackedZ(k1) * 16 + 8);
-            BlockPos site2 = new BlockPos(ChunkPos.getPackedX(k2) * 16 + 8, (int) playerPos.getY(), ChunkPos.getPackedZ(k2) * 16 + 8);
+            BlockPos site1 = new BlockPos(ChunkPos.getPackedX(k1) * 16 + 8, (int) py, ChunkPos.getPackedZ(k1) * 16 + 8);
+            BlockPos site2 = new BlockPos(ChunkPos.getPackedX(k2) * 16 + 8, (int) py, ChunkPos.getPackedZ(k2) * 16 + 8);
 
-            Vec3d dir1 = new Vec3d(site1.getX() - playerPos.x, 0, site1.getZ() - playerPos.z).normalize();
-            Vec3d dir2 = new Vec3d(site2.getX() - playerPos.x, 0, site2.getZ() - playerPos.z).normalize();
+            Vec3d dir1 = new Vec3d(site1.getX() - px, 0, site1.getZ() - pz).normalize();
+            Vec3d dir2 = new Vec3d(site2.getX() - px, 0, site2.getZ() - pz).normalize();
             Vec3d flatLook = new Vec3d(lookVec.x, 0, lookVec.z).normalize();
 
             return Double.compare(dir2.dotProduct(flatLook), dir1.dotProduct(flatLook));
@@ -852,10 +893,10 @@ public class Skipper extends Module {
 
         for (long key : candidates) {
             if (viablePreviews.size() >= MAX_ALTERNATIVE_PORTAL_PREVIEWS + 1) break;
-            if (getTrailLavaRejection(key, requiredTrailWidth, new PortalScanStats(), trailFlowStateCache) != null) continue;
+            if (getTrailLavaRejection(key, requiredTrailWidth, trailFlowStateCache) != null) continue;
             if (findNearbyPortal(key) != null) continue;
 
-            PortalSite selectedSite = findPortalSite(ChunkPos.getPackedX(key), ChunkPos.getPackedZ(key), new PortalScanStats());
+            PortalSite selectedSite = findPortalSite(ChunkPos.getPackedX(key), ChunkPos.getPackedZ(key));
             if (selectedSite != null) {
                 if (!isPortalSiteDistinct(selectedSite, viablePreviews.values())) continue;
                 TrailEra era = detectClusterEra(key);
@@ -880,7 +921,7 @@ public class Skipper extends Module {
         if (newPrimary) {
             triggerAlerts();
             portalSkipIdleTicksRemaining = portalHoldTicks.get();
-            activePreviewValidationTicksRemaining = 0;
+            activePreviewValidationTicksRemaining = 10;
         }
         if (primaryPreview == null) primaryPreview = portalPreviews.get(primaryKey);
 
@@ -923,7 +964,7 @@ public class Skipper extends Module {
         return true;
     }
 
-    private String getTrailLavaRejection(long centerChunkKey, int width, PortalScanStats stats,
+    private String getTrailLavaRejection(long centerChunkKey, int width,
                                          Map<Long, TrailChunkFlowState> stateCache) {
         int centerChunkX = ChunkPos.getPackedX(centerChunkKey);
         int centerChunkZ = ChunkPos.getPackedZ(centerChunkKey);
@@ -933,14 +974,14 @@ public class Skipper extends Module {
         for (int xOffset = startOffset; xOffset < startOffset + width; xOffset++) {
             for (int zOffset = startOffset; zOffset < startOffset + width; zOffset++) {
                 String rejection = checkTrailChunkForFlow(
-                    centerChunkX + xOffset, centerChunkZ + zOffset, now, stats, stateCache);
+                    centerChunkX + xOffset, centerChunkZ + zOffset, now, stateCache);
                 if (rejection != null) return rejection;
             }
         }
         return null;
     }
 
-    private String checkTrailChunkForFlow(int chunkX, int chunkZ, long now, PortalScanStats stats,
+    private String checkTrailChunkForFlow(int chunkX, int chunkZ, long now,
                                           Map<Long, TrailChunkFlowState> stateCache) {
         long chunkKey = ChunkPos.toLong(chunkX, chunkZ);
         TrailChunkFlowState state = stateCache.get(chunkKey);
@@ -953,15 +994,19 @@ public class Skipper extends Module {
                     state = TrailChunkFlowState.SETTLING;
                 } else {
                     WorldChunk chunk = mc.world.getChunk(chunkX, chunkZ);
-                    state = TrailChunkFlowState.CLEAR;
-                    for (ChunkSection section : chunk.getSectionArray()) {
-                        if (section == null || section.isEmpty()) continue;
-                        if (section.hasAny(blockState -> {
-                            FluidState fluid = blockState.getFluidState();
-                            return fluid.isIn(FluidTags.LAVA) && !fluid.isStill();
-                        })) {
-                            state = TrailChunkFlowState.FLOWING;
-                            break;
+                    if (lavaFallsByChunk.containsKey(chunk.getPos())) {
+                        state = TrailChunkFlowState.FLOWING;
+                    } else {
+                        state = TrailChunkFlowState.CLEAR;
+                        for (ChunkSection section : chunk.getSectionArray()) {
+                            if (section == null || section.isEmpty()) continue;
+                            if (section.hasAny(blockState -> {
+                                FluidState fluid = blockState.getFluidState();
+                                return fluid.isIn(FluidTags.LAVA) && !fluid.isStill();
+                            })) {
+                                state = TrailChunkFlowState.FLOWING;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1007,10 +1052,13 @@ public class Skipper extends Module {
         int centerZ = ChunkPos.getPackedZ(chunkKey) * 16 + 8;
         int spacing = minPortalSpacing.get();
         long spacingSquared = (long) spacing * spacing;
+        double px = mc.player.getX();
+        double py = mc.player.getY();
+        double pz = mc.player.getZ();
 
         for (Set<BlockPos> portalBlocks : portalBlocksByChunk.values()) {
             for (BlockPos portal : portalBlocks) {
-                if (netherReentryTicksRemaining > 0 && portal.isWithinDistance(mc.player.getPos(), 16.0)) continue;
+                if (netherReentryTicksRemaining > 0 && squaredDistanceTo(portal, px, py, pz) <= 256.0) continue;
                 long dx = (long) portal.getX() - centerX;
                 long dz = (long) portal.getZ() - centerZ;
                 if (dx * dx + dz * dz <= spacingSquared) return portal;
@@ -1023,12 +1071,13 @@ public class Skipper extends Module {
         ChunkPos chunkPos = chunk.getPos();
         Set<BlockPos> portalBlocks = ConcurrentHashMap.newKeySet();
         ChunkSection[] sections = chunk.getSectionArray();
+        int bottomSectionCoord = chunk.getBottomY() >> 4;
 
         for (int sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
             ChunkSection section = sections[sectionIndex];
             if (section == null || section.isEmpty() || !section.hasAny(state -> state.isOf(Blocks.NETHER_PORTAL))) continue;
 
-            int sectionMinY = (chunk.getBottomSectionCoord() + sectionIndex) << 4;
+            int sectionMinY = (bottomSectionCoord + sectionIndex) << 4;
             for (int x = 0; x < 16; x++) {
                 for (int y = 0; y < 16; y++) {
                     for (int z = 0; z < 16; z++) {
@@ -1122,25 +1171,28 @@ public class Skipper extends Module {
         Map.Entry<Long, PortalPreview> activePreview = portalPreviews.entrySet().stream().findFirst().orElse(null);
         if (activePreview == null) return;
         long previewKey = activePreview.getKey();
-        PortalSkipDetection detector = getPortalSkipDetection();
-        if (detector == null || !detector.isEnabled()) {
+        Object detector = getPortalSkipDetectionModule();
+        if (detector == null || !isXaeroModuleEnabled(detector) || isPortalPreviewUnsafe(previewKey, activePreview.getValue())) {
             portalPreviews.remove(previewKey);
-            if (previewKey == activePortalSkipKey) activePortalSkipKey = null;
+            if (activePortalSkipKey != null && previewKey == activePortalSkipKey.longValue()) {
+                activePortalSkipKey = null;
+            }
+            portalSkipIdleTicksRemaining = 0;
         }
     }
 
-    private PortalSite findPortalSite(int centerChunkX, int centerChunkZ, PortalScanStats stats) {
+    private PortalSite findPortalSite(int centerChunkX, int centerChunkZ) {
         int centerX = centerChunkX * 16 + 8;
         int centerZ = centerChunkZ * 16 + 8;
 
-        for (int horizontalRadius = 0; horizontalRadius <= 8; horizontalRadius++) {
+        for (int horizontalRadius = 0; horizontalRadius <= 6; horizontalRadius++) {
             for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
                 for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != horizontalRadius) continue;
-                    for (int baseY = 10; baseY <= 120; baseY += 4) {
+                    for (int baseY = 32; baseY <= 116; baseY += 2) {
                         BlockPos base = new BlockPos(centerX + dx, baseY, centerZ + dz);
-                        if (isLavaSafePortalSite(base, Direction.Axis.X, stats)) return new PortalSite(base, Direction.Axis.X);
-                        if (isLavaSafePortalSite(base, Direction.Axis.Z, stats)) return new PortalSite(base, Direction.Axis.Z);
+                        if (isLavaSafePortalSite(base, Direction.Axis.X)) return new PortalSite(base, Direction.Axis.X);
+                        if (isLavaSafePortalSite(base, Direction.Axis.Z)) return new PortalSite(base, Direction.Axis.Z);
                     }
                 }
             }
@@ -1148,8 +1200,10 @@ public class Skipper extends Module {
         return null;
     }
 
-    private boolean isLavaSafePortalSite(BlockPos base, Direction.Axis axis, PortalScanStats stats) {
-        if (base.getY() <= mc.world.getBottomY() || base.getY() + 4 >= mc.world.getBottomY() + mc.world.getHeight()) return false;
+    private boolean isLavaSafePortalSite(BlockPos base, Direction.Axis axis) {
+        int bottomY = mc.world.getBottomY();
+        int topYExclusive = bottomY + mc.world.getHeight();
+        if (base.getY() <= bottomY || base.getY() + 4 >= topYExclusive) return false;
         for (int horizontal = 0; horizontal < 4; horizontal++) {
             int x = base.getX() + (axis == Direction.Axis.X ? horizontal : 0);
             int z = base.getZ() + (axis == Direction.Axis.Z ? horizontal : 0);
@@ -1164,6 +1218,20 @@ public class Skipper extends Module {
                 if (!isChunkLoaded(frameOrInterior)) return false;
                 if (mc.world.getFluidState(frameOrInterior).isIn(FluidTags.LAVA)) return false;
                 if (!mc.world.getBlockState(frameOrInterior).isReplaceable()) return false;
+            }
+        }
+
+        // Check a 2-block safety margin around the portal frame so portals don't spawn right next to lava
+        for (int dx = -2; dx <= 5; dx++) {
+            for (int dz = -2; dz <= 5; dz++) {
+                for (int dy = -1; dy <= 5; dy++) {
+                    int checkX = base.getX() + (axis == Direction.Axis.X ? dx : dz);
+                    int checkZ = base.getZ() + (axis == Direction.Axis.Z ? dx : dz);
+                    BlockPos checkPos = new BlockPos(checkX, base.getY() + dy, checkZ);
+                    if (!isChunkLoaded(checkPos)) return false;
+                    FluidState fs = mc.world.getFluidState(checkPos);
+                    if (fs.isIn(FluidTags.LAVA) && !fs.isStill()) return false;
+                }
             }
         }
         return true;
@@ -1184,8 +1252,10 @@ public class Skipper extends Module {
 
         int vRadius = verticalRadius.get();
         int playerY = (int) mc.player.getY();
-        int minY = Math.max(mc.world.getBottomY(), playerY - vRadius);
-        int maxY = Math.min(mc.world.getBottomY() + mc.world.getHeight(), playerY + vRadius);
+        int bottomY = mc.world.getBottomY();
+        int minY = Math.max(bottomY, playerY - vRadius);
+        int maxY = Math.min(bottomY + mc.world.getHeight(), playerY + vRadius);
+        int bottomSectionCoord = chunk.getBottomY() >> 4;
 
         Set<BlockPos> fallTips = new HashSet<>();
         ChunkSection[] sections = chunk.getSectionArray();
@@ -1193,7 +1263,7 @@ public class Skipper extends Module {
         for (int i = 0; i < sections.length; i++) {
             ChunkSection section = sections[i];
             if (section == null || section.isEmpty()) continue;
-            int sectionMinY = (chunk.getBottomSectionCoord() + i) << 4;
+            int sectionMinY = (bottomSectionCoord + i) << 4;
             if (sectionMinY + 15 < minY || sectionMinY > maxY) continue;
             if (!section.hasAny(s -> s.getFluidState().isIn(FluidTags.LAVA))) continue;
 
@@ -1274,63 +1344,130 @@ public class Skipper extends Module {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // XaeroPlus Integration
+    // XaeroPlus Reflection Bridge (Version-Resilient 1.21.4 - 1.21.11)
     // ═══════════════════════════════════════════════════════════════════════════
+
+    private static Object getXaeroModule(String className) {
+        try {
+            Class<?> managerClass = Class.forName("xaeroplus.module.ModuleManager");
+            Class<?> moduleClass = Class.forName(className);
+            Method getModule = managerClass.getMethod("getModule", Class.class);
+            return getModule.invoke(null, moduleClass);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isXaeroModuleEnabled(Object module) {
+        if (module == null) return false;
+        try {
+            Method isEnabled = module.getClass().getMethod("isEnabled");
+            return Boolean.TRUE.equals(isEnabled.invoke(module));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void setXaeroModuleEnabled(Object module, boolean enabled) {
+        if (module == null) return;
+        try {
+            Method setEnabled = module.getClass().getMethod("setEnabled", boolean.class);
+            setEnabled.invoke(module, enabled);
+        } catch (Throwable ignored) {}
+    }
 
     private void syncToXaeroPlus(boolean inNether) {
         try {
+            Object liquidNewChunksMod = getXaeroModule("xaeroplus.module.impl.LiquidNewChunks");
             if (!inNether) {
                 if (xaeroPlusSyncedToNether) {
-                    ModuleManager.getModule(LiquidNewChunks.class).setEnabled(false);
+                    setXaeroModuleEnabled(liquidNewChunksMod, false);
                     xaeroPlusSyncedToNether = false;
                 }
                 return;
             }
-            ModuleManager.getModule(LiquidNewChunks.class).setEnabled(detectLiquidNewChunks.get());
-            if (useXaeroPaletteNewChunks.get()) ModuleManager.getModule(PaletteNewChunks.class).setEnabled(true);
-            if (classify112Blocks.get()) ModuleManager.getModule(OldChunks.class).setEnabled(true);
-            Settings.REGISTRY.liquidNewChunksOnlyAboveY0Setting.setValue(onlyAboveY0.get());
+            setXaeroModuleEnabled(liquidNewChunksMod, detectLiquidNewChunks.get());
+            if (useXaeroPaletteNewChunks.get()) {
+                setXaeroModuleEnabled(getXaeroModule("xaeroplus.module.impl.PaletteNewChunks"), true);
+            }
+            if (classify112Blocks.get()) {
+                setXaeroModuleEnabled(getXaeroModule("xaeroplus.module.impl.OldChunks"), true);
+            }
+            setXaeroOnlyAboveY0(onlyAboveY0.get());
             xaeroPlusSyncedToNether = true;
+        } catch (Throwable ignored) {}
+    }
+
+    private static void setXaeroOnlyAboveY0(boolean value) {
+        try {
+            Class<?> settingsClass = Class.forName("xaeroplus.settings.Settings");
+            Field registryField = settingsClass.getField("REGISTRY");
+            Object registry = registryField.get(null);
+            Field settingField = registry.getClass().getField("liquidNewChunksOnlyAboveY0Setting");
+            Object settingObj = settingField.get(registry);
+            for (Method m : settingObj.getClass().getMethods()) {
+                if (m.getName().equals("setValue") && m.getParameterCount() == 1) {
+                    m.invoke(settingObj, value);
+                    break;
+                }
+            }
         } catch (Throwable ignored) {}
     }
 
     private boolean isXaeroPaletteNewChunk(int chunkX, int chunkZ) {
         try {
-            PaletteNewChunks pnc = ModuleManager.getModule(PaletteNewChunks.class);
-            return pnc != null && pnc.isEnabled() && pnc.isNewChunk(chunkX, chunkZ, World.NETHER);
-        } catch (Throwable ignored) { return false; }
+            Object pnc = getXaeroModule("xaeroplus.module.impl.PaletteNewChunks");
+            if (!isXaeroModuleEnabled(pnc)) return false;
+            Method isNewChunk = pnc.getClass().getMethod("isNewChunk", int.class, int.class, RegistryKey.class);
+            return Boolean.TRUE.equals(isNewChunk.invoke(pnc, chunkX, chunkZ, World.NETHER));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean isXaeroLiquidNewChunk(int chunkX, int chunkZ) {
+        try {
+            Object lnc = getXaeroModule("xaeroplus.module.impl.LiquidNewChunks");
+            if (!isXaeroModuleEnabled(lnc)) return false;
+            Method isNewChunk = lnc.getClass().getMethod("isNewChunk", int.class, int.class, RegistryKey.class);
+            return Boolean.TRUE.equals(isNewChunk.invoke(lnc, chunkX, chunkZ, World.NETHER));
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private boolean isXaeroOldChunk(int chunkX, int chunkZ) {
         try {
-            OldChunks oc = ModuleManager.getModule(OldChunks.class);
-            return oc != null && oc.isEnabled() && oc.isOldChunk(chunkX, chunkZ, World.NETHER);
-        } catch (Throwable ignored) { return false; }
+            Object oc = getXaeroModule("xaeroplus.module.impl.OldChunks");
+            if (!isXaeroModuleEnabled(oc)) return false;
+            Method isOldChunk = oc.getClass().getMethod("isOldChunk", int.class, int.class, RegistryKey.class);
+            return Boolean.TRUE.equals(isOldChunk.invoke(oc, chunkX, chunkZ, World.NETHER));
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private void syncPortalSkipDetection(boolean enabled) {
-        if (!enabled && !portalDetectionEnabledBySkipper) return;
-        PortalSkipDetection detector = getPortalSkipDetection();
+        Object detector = getPortalSkipDetectionModule();
         if (detector == null) return;
-        if (enabled) {
-            if (!detector.isEnabled()) {
-                detector.setEnabled(true);
-                portalDetectionEnabledBySkipper = true;
-            }
-            detector.setPortalRadius(portalRadius.get());
-            detector.setSearchDelayTicks(1);
-            return;
+        if (!isXaeroModuleEnabled(detector)) {
+            setXaeroModuleEnabled(detector, true);
         }
-        if (portalDetectionEnabledBySkipper && detector.isEnabled()) detector.setEnabled(false);
-        portalDetectionEnabledBySkipper = false;
+        try {
+            Method setRadius = detector.getClass().getMethod("setPortalRadius", int.class);
+            setRadius.invoke(detector, portalRadius.get());
+        } catch (Throwable ignored) {}
+        try {
+            Method setDelay = detector.getClass().getMethod("setSearchDelayTicks", int.class);
+            setDelay.invoke(detector, 1);
+        } catch (Throwable ignored) {}
     }
 
-    private PortalSkipDetection getPortalSkipDetection() {
-        try { return ModuleManager.getModule(PortalSkipDetection.class); }
-        catch (LinkageError | Exception e) { return null; }
+    private Object getPortalSkipDetectionModule() {
+        return getXaeroModule("xaeroplus.module.impl.PortalSkipDetection");
     }
 
-    private Iterable<?> getPortalSkipHighlights(PortalSkipDetection detector) {
+    private Iterable<?> getPortalSkipHighlights(Object detector) {
         try {
             for (Method method : detector.getClass().getMethods()) {
                 if (method.getName().equals("getHighlightsState") && method.getParameterCount() == 1) {
@@ -1341,19 +1478,24 @@ public class Skipper extends Module {
                     if (highlights instanceof Iterable<?> iterable) return iterable;
                 }
             }
-        } catch (ReflectiveOperationException ignored) {}
-        return List.of();
+        } catch (Throwable ignored) {}
+        return Collections.emptyList();
     }
 
     public int getXaeroColor(int chunkX, int chunkZ) {
         if (!isNether()) return 0;
+        // When nativeXaeroMapCoexistence is true (default), return 0 so XaeroPlus's
+        // built-in OldChunks, PaletteNewChunks, LiquidNewChunks, and PortalSkipDetection
+        // render natively on the Minimap and World Map without Skipper painting over them.
+        if (nativeXaeroMapCoexistence.get()) return 0;
+
         long key = ChunkPos.toLong(chunkX, chunkZ);
         TrailEra era = getChunkEra(key);
 
+        if (shouldSkipEra(era)) return 0;
+
         if (lavaFallsByChunk.containsKey(new ChunkPos(chunkX, chunkZ))) {
-            if (era != TrailEra.ERA_1_19_FRESH) {
-                return era == TrailEra.ERA_1_12 ? toRgba(color112.get()) : toRgba(color119.get());
-            }
+            return era == TrailEra.ERA_1_12 ? toRgba(color112.get()) : toRgba(color119.get());
         }
         if (era == TrailEra.ERA_MIXED_1_12_TRAIL) return toRgba(mixed112On119Color.get());
         if (era == TrailEra.ERA_1_12) return toRgba(color112.get());
@@ -1373,15 +1515,17 @@ public class Skipper extends Module {
     private void onRender(Render3DEvent event) {
         if (!render3D.get() || mc.player == null || !isNether()) return;
 
+        ChunkPos playerChunk = mc.player.getChunkPos();
+
         if (portalSkipEnabled.get()) {
             int maxPreviewDistance = Math.max(48, mc.options.getViewDistance().getValue() + portalRadius.get() + 10);
             for (Map.Entry<Long, PortalPreview> entry : portalPreviews.entrySet()) {
                 PortalPreview preview = entry.getValue();
                 BlockPos base = preview.site().base();
-                if (mc.player.getChunkPos().getChebyshevDistance(new ChunkPos(base)) <= maxPreviewDistance) {
+                if (getChunkChebyshevDistance(playerChunk, new ChunkPos(base)) <= maxPreviewDistance) {
                     Box portalBox = new Box(base.getX(), base.getY(), base.getZ(), base.getX() + 4, base.getY() + 5, base.getZ() + 4);
-                    if (isInFrustum(portalBox)) {
-                        SettingColor portalColor = (preview.era() == TrailEra.ERA_1_12) ? color112.get() : color119.get();
+                    if (isInRenderBounds(portalBox)) {
+                        SettingColor portalColor = getEraColor(preview.era());
                         renderGhostPortal(event, preview.site(), portalColor);
                     }
                 }
@@ -1390,10 +1534,10 @@ public class Skipper extends Module {
             for (Map.Entry<Long, TimedPortalPreview> entry : alternativePortalPreviews.entrySet()) {
                 PortalPreview preview = entry.getValue().preview();
                 BlockPos base = preview.site().base();
-                if (mc.player.getChunkPos().getChebyshevDistance(new ChunkPos(base)) <= maxPreviewDistance) {
+                if (getChunkChebyshevDistance(playerChunk, new ChunkPos(base)) <= maxPreviewDistance) {
                     Box portalBox = new Box(base.getX(), base.getY(), base.getZ(), base.getX() + 4, base.getY() + 5, base.getZ() + 4);
-                    if (isInFrustum(portalBox)) {
-                        SettingColor portalColor = (preview.era() == TrailEra.ERA_1_12) ? color112.get() : color119.get();
+                    if (isInRenderBounds(portalBox)) {
+                        SettingColor portalColor = getEraColor(preview.era());
                         renderGhostPortal(event, preview.site(), withAlpha(portalColor, Math.max(20, portalColor.a / 2)));
                     }
                 }
@@ -1401,17 +1545,20 @@ public class Skipper extends Module {
         }
 
         if (lavaMarkerEnabled.get()) {
+            BlockPos playerBlockPos = mc.player.getBlockPos();
+            double maxLavaDistSq = 96.0 * 96.0;
+
             for (Map.Entry<ChunkPos, Set<BlockPos>> entry : lavaFallsByChunk.entrySet()) {
                 ChunkPos cp = entry.getKey();
                 TrailEra era = getChunkEra(cp.toLong());
                 
-                if (era == TrailEra.ERA_1_19_FRESH) continue;
+                if (shouldSkipEra(era)) continue;
 
-                SettingColor markerColor = (era == TrailEra.ERA_1_12) ? color112.get() : color119.get();
+                SettingColor markerColor = getEraColor(era);
 
                 Map<Long, List<Integer>> columns = new HashMap<>();
                 for (BlockPos pos : entry.getValue()) {
-                    if (!mc.player.getBlockPos().isWithinDistance(pos, 96)) continue;
+                    if (squaredDistanceBetween(playerBlockPos, pos) > maxLavaDistSq) continue;
                     FluidState fs = mc.world.getFluidState(pos);
                     if (!fs.isIn(FluidTags.LAVA) || fs.isStill()) continue;
 
@@ -1436,7 +1583,7 @@ public class Skipper extends Module {
                             prevY = y;
                         } else {
                             Box columnBox = new Box(x, startY, z, x + 1.0, prevY + 1.0, z + 1.0);
-                            if (isInFrustum(columnBox)) {
+                            if (isInRenderBounds(columnBox)) {
                                 renderStyledBox(event, columnBox, markerColor);
                             }
                             startY = y;
@@ -1444,12 +1591,20 @@ public class Skipper extends Module {
                         }
                     }
                     Box columnBox = new Box(x, startY, z, x + 1.0, prevY + 1.0, z + 1.0);
-                    if (isInFrustum(columnBox)) {
+                    if (isInRenderBounds(columnBox)) {
                         renderStyledBox(event, columnBox, markerColor);
                     }
                 }
             }
         }
+    }
+
+    private SettingColor getEraColor(TrailEra era) {
+        return switch (era) {
+            case ERA_1_12 -> color112.get();
+            case ERA_MIXED_1_12_TRAIL -> mixed112On119Color.get();
+            case ERA_1_19_FRESH, ERA_1_19_TRAIL -> color119.get();
+        };
     }
 
     private void renderGhostPortal(Render3DEvent event, PortalSite site, SettingColor color) {
@@ -1497,9 +1652,15 @@ public class Skipper extends Module {
         }
     }
 
-    private boolean isInFrustum(Box box) {
+    private boolean isInRenderBounds(Box box) {
         Camera camera = mc.gameRenderer.getCamera();
-        return camera.getFocusedEntity() != null && camera.getFocusedEntity().getBoundingBox().expand(256).intersects(box);
+        if (camera == null) return false;
+        Vec3d camPos = camera.getPos();
+        Box renderZone = new Box(
+            camPos.x - 256, camPos.y - 256, camPos.z - 256,
+            camPos.x + 256, camPos.y + 256, camPos.z + 256
+        );
+        return renderZone.intersects(box);
     }
 
     private void renderPortalBeam(Render3DEvent event, PortalSite site, SettingColor color) {
