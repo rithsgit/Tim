@@ -2,16 +2,19 @@
 
 **Meteor Client addon** providing utilities focused on **stash hunting**, **base hunting**, and general survival/QoL on the 2b2t anarchy server (and similar environments).
 
-Modules List;
+## Modules
+
 - Baromine
 - Chambers Assistant
 - City Assistant
 - Datamine
+- Dog Tag
 - Dungeon Assistant
 - Eight To One
 - Elytra Assistant
 - Gatekeeper
 - Graveyard
+- Groundwork
 - Handhold
 - Handmold
 - Illushine
@@ -26,17 +29,21 @@ Modules List;
 - Penpal
 - Portal Maker
 - Raidar
+- Ringmaster
 - Rocket Pilot
 - Safety Net
 - Server Healthcare System
 - Sign Scanner
+- Skipper
 - Third Sight
+- Threaturn
 - Time Throttle
 - Total Disposal
 - Tunnelers
 - Waypearl
 
-HUD List
+## HUDs
+
 - Baromine
 - Motance
 - Portal Stock
@@ -58,25 +65,27 @@ HUD List
 - Statistics Information
 - Time Throttle
 
-More modules/huds coming soon — 
+More modules and HUDs are planned.
 
 ## Requirements
 
-- Minecraft **1.21.x** (or whichever version your addon targets — check `gradle/libs.versions.toml`)
+- Minecraft **1.21.4, 1.21.5, 1.21.8, or 1.21.11**
+- Java **21 or newer**
 - [Fabric Loader](https://fabricmc.net/use/installer/)
-- [Meteor Client](https://meteorclient.com/) (latest snapshot recommended for 2b2t compatibility)
-- This addon JAR
+- [Meteor Client](https://meteorclient.com/) compatible with your Minecraft version
+- Tim addon JAR built for the same Minecraft version
 
 ## Installation
 
 1. Download the latest release JAR from [Releases](https://github.com/rithsgit/HuntingUtilitiesBETA/releases) (or build from source — see below).
-2. Place the JAR in your Minecraft `mods` folder **alongside** Meteor Client.
-3. Launch Minecraft using the Fabric profile.
-4. In-game: Open Meteor GUI (`Right Shift` by default) → your HuntingUtilities modules should appear in the module list.
+2. Make sure Fabric Loader and Meteor Client are installed for the same Minecraft version as the addon.
+3. Place the addon JAR in your Minecraft `mods` folder alongside Meteor Client.
+4. Launch Minecraft using the Fabric profile.
+5. Open Meteor's GUI (default key: `Right Shift`) and find the modules under the **Tim** category.
 
 ## Building from Source
 
-This project uses the Meteor Addon Template structure.
+This project uses Gradle and supports building a separate addon JAR for each supported Minecraft version.
 
 ### Setup
 
