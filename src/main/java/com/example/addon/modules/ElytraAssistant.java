@@ -1,23 +1,39 @@
 package com.example.addon.modules;
 
-import com.example.addon.HuntingUtilities;
-import meteordevelopment.meteorclient.events.world.TickEvent;
-import meteordevelopment.meteorclient.settings.*;
-import meteordevelopment.meteorclient.systems.modules.Module;
-import meteordevelopment.meteorclient.systems.modules.Modules;
-import meteordevelopment.meteorclient.utils.misc.input.Input;
-import meteordevelopment.meteorclient.utils.misc.Keybind;
-import meteordevelopment.meteorclient.utils.player.FindItemResult;
-import meteordevelopment.meteorclient.utils.player.InvUtils;
-import meteordevelopment.meteorclient.utils.player.Rotations;
-import meteordevelopment.orbit.EventHandler;
-import net.minecraft.entity.EquipmentSlot;
-import net.minecraft.item.ItemStack;
-import net.minecraft.item.Items;
-import net.minecraft.util.Hand;
 import org.lwjgl.glfw.GLFW;
 
+import com.example.addon.Tim;
+
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.KeybindSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.misc.input.Input;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.orbit.EventHandler;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
+import net.minecraft.sound.SoundEvent;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
+
 public class ElytraAssistant extends Module {
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Enums
+    // ═══════════════════════════════════════════════════════════════════════════
 
     public enum MiddleClickAction {
         None,
@@ -25,391 +41,470 @@ public class ElytraAssistant extends Module {
         Pearl
     }
 
-    private final SettingGroup sgDurability = settings.createGroup("Durability");
-    private final SettingGroup sgChestplate = settings.createGroup("Chestplate Swap");
-    private final SettingGroup sgUtilities  = settings.createGroup("Utilities");
-    private final SettingGroup sgMending  = settings.createGroup("Auto Mending");
-    
-    // ─── Durability ────────────────────────────────────────
-    private final Setting<Boolean> autoSwap = sgDurability.add(new BoolSetting.Builder()
-        .name("auto-swap")
-        .description("Swaps to a fresh elytra when current one is low on durability.")
+    public enum WarningSound {
+        Anvil,
+        WitherSpawn,
+        CreeperPrimed,
+        ExperienceOrb,
+        Bell,
+        NoteBassDrum;
+
+        public SoundEvent toSoundEvent() {
+            return switch (this) {
+                case Anvil         -> SoundEvents.BLOCK_ANVIL_LAND;
+                case WitherSpawn   -> SoundEvents.ENTITY_WITHER_SPAWN;
+                case CreeperPrimed -> SoundEvents.ENTITY_CREEPER_PRIMED;
+                case ExperienceOrb -> SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP;
+                case Bell          -> SoundEvents.BLOCK_BELL_USE;
+                case NoteBassDrum  -> SoundEvents.BLOCK_NOTE_BLOCK_BASEDRUM.value();
+            };
+        }
+    }
+
+    public enum ReplenishMode {
+        Bind,
+        Automatic
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Setting Groups
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private final SettingGroup sgAutoReplace     = settings.createGroup("Auto Replace");
+    private final SettingGroup sgMiddleClick     = settings.createGroup("Middle Click");
+    private final SettingGroup sgRocketReplenish = settings.createGroup("Rocket Replenish");
+
+    // --- Multi-Version Registry Helpers (1.21.4 - 1.21.11) ---
+    private static Item optItem(String path) {
+        Identifier id = Identifier.ofVanilla(path);
+        return Registries.ITEM.containsId(id) ? Registries.ITEM.get(id) : null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Settings — Auto Replace
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private final Setting<Boolean> autoReplace = sgAutoReplace.add(new BoolSetting.Builder()
+        .name("auto-replace")
+        .description("Automatically replace elytra when durability is low.")
         .defaultValue(true)
-        .onChanged(this::onAutoSwapChanged)
         .build()
     );
 
-    private final Setting<Integer> durabilityThreshold = sgDurability.add(new IntSetting.Builder()
+    private final Setting<Integer> durabilityThreshold = sgAutoReplace.add(new IntSetting.Builder()
         .name("durability-threshold")
-        .description("Remaining durability below which swap occurs.")
+        .description("Minimum durability before replacing.")
         .defaultValue(10)
         .min(1)
         .sliderMax(100)
-        .visible(autoSwap::get)
+        .visible(autoReplace::get)
         .build()
     );
 
-    private final Setting<Keybind> autoSwapKey = sgDurability.add(new KeybindSetting.Builder()
+    private final Setting<WarningSound> warningSoundType = sgAutoReplace.add(new EnumSetting.Builder<WarningSound>()
+        .name("warning-sound")
+        .description("Sound played when no replacement elytra is available.")
+        .defaultValue(WarningSound.Anvil)
+        .visible(autoReplace::get)
+        .build()
+    );
+
+    private final Setting<Double> warningSoundVolume = sgAutoReplace.add(new DoubleSetting.Builder()
+        .name("warning-volume")
+        .description("Volume of the warning sound.")
+        .defaultValue(1.0)
+        .min(0.1)
+        .sliderMax(2.0)
+        .visible(autoReplace::get)
+        .build()
+    );
+
+    private final Setting<Keybind> toggleKey = sgAutoReplace.add(new KeybindSetting.Builder()
         .name("toggle-key")
-        .description("Key to toggle auto swap.")
+        .description("Key to toggle auto replace.")
         .defaultValue(Keybind.none())
         .action(() -> {
-            boolean newVal = !autoSwap.get();
-            autoSwap.set(newVal);
-            info("Auto Swap " + (newVal ? "enabled" : "disabled") + ".");
+            if (mc.currentScreen != null) return;
+            boolean enabled = !autoReplace.get();
+            autoReplace.set(enabled);
+            info("Auto Replace " + (enabled ? "enabled" : "disabled") + ".");
         })
         .build()
     );
 
-    // ─── Chestplate Swap ───────────────────────────────────
-    private final Setting<Boolean> chestplateOnGround = sgChestplate.add(new BoolSetting.Builder()
-        .name("chestplate-on-ground")
-        .description("Wears chestplate on ground, elytra while flying.")
-        .defaultValue(false)
-        .build()
-    );
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Settings — Middle Click
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    private final Setting<Keybind> chestplateToggleKey = sgChestplate.add(new KeybindSetting.Builder()
-        .name("toggle-key")
-        .description("Key to toggle chestplate swapping.")
-        .defaultValue(Keybind.none())
-        .action(() -> {
-            boolean newVal = !chestplateOnGround.get();
-            chestplateOnGround.set(newVal);
-            info("Chestplate swap " + (newVal ? "enabled" : "disabled") + ".");
-        })
-        .build()
-    );
-
-    private final Setting<Integer> swapDelay = sgDurability.add(new IntSetting.Builder()
-        .name("swap-delay")
-        .description("Ticks to wait after performing a swap.")
-        .defaultValue(10)
-        .min(0)
-        .visible(() -> autoSwap.get() || chestplateOnGround.get())
-        .build()
-    );
-
-    // ─── Utilities ────────────────────────────────────────
-    private final Setting<MiddleClickAction> middleClickAction = sgUtilities.add(new EnumSetting.Builder<MiddleClickAction>()
-        .name("middle-click-action")
+    private final Setting<MiddleClickAction> middleClickAction = sgMiddleClick.add(new EnumSetting.Builder<MiddleClickAction>()
+        .name("action")
         .description("Item to use when middle clicking.")
         .defaultValue(MiddleClickAction.None)
         .build()
     );
 
-    public final Setting<Boolean> silentRocket = sgUtilities.add(new BoolSetting.Builder()
+    public final Setting<Boolean> silentRocket = sgMiddleClick.add(new BoolSetting.Builder()
         .name("silent-rocket")
         .description("Prevents hand swing animation when using rockets.")
         .defaultValue(true)
         .build()
     );
 
-    public final Setting<Boolean> preventGroundUsage = sgUtilities.add(new BoolSetting.Builder()
-        .name("prevent-ground-usage")
-        .description("Blocks rocket usage while standing on ground.")
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Settings — Rocket Replenish
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private final Setting<Boolean> rocketReplenishEnabled = sgRocketReplenish.add(new BoolSetting.Builder()
+        .name("rocket-replenish")
+        .description("Enables the rocket replenish system.")
         .defaultValue(true)
         .build()
     );
 
-    public final Setting<Boolean> autoSwing = sgUtilities.add(new BoolSetting.Builder()
-        .name("auto-swing")
-        .description("Automatically swings your hand periodically.")
+    private final Setting<ReplenishMode> replenishMode = sgRocketReplenish.add(new EnumSetting.Builder<ReplenishMode>()
+        .name("replenish-mode")
+        .description("Toggle between using a keybind or doing it automatically.")
+        .defaultValue(ReplenishMode.Bind)
+        .visible(rocketReplenishEnabled::get)
+        .build()
+    );
+
+    private final Setting<Integer> autoThreshold = sgRocketReplenish.add(new IntSetting.Builder()
+        .name("auto-threshold")
+        .description("Rocket count at which the slot automatically refills.")
+        .defaultValue(5)
+        .min(1)
+        .sliderMax(63)
+        .visible(() -> rocketReplenishEnabled.get() && replenishMode.get() == ReplenishMode.Automatic)
+        .build()
+    );
+
+    private final Setting<Boolean> useSelectedSlot = sgRocketReplenish.add(new BoolSetting.Builder()
+        .name("use-selected-slot")
+        .description("Replenishes the currently selected hotbar slot instead of a specific one.")
         .defaultValue(false)
+        .visible(rocketReplenishEnabled::get)
         .build()
     );
 
-    public final Setting<Double> swingInterval = sgUtilities.add(new DoubleSetting.Builder()
-        .name("swing-interval")
-        .description("Interval in seconds between swings.")
-        .defaultValue(5.0)
-        .min(0.1)
-        .sliderMax(30.0)
-        .visible(autoSwing::get)
+    private final Setting<Integer> targetSlot = sgRocketReplenish.add(new IntSetting.Builder()
+        .name("target-slot")
+        .description("The specific hotbar slot to replenish (1-9).")
+        .defaultValue(8)
+        .min(1)
+        .max(9)
+        .visible(() -> rocketReplenishEnabled.get() && !useSelectedSlot.get())
         .build()
     );
 
-    // ─── Auto Mending ───────────────────────────────────
-    private final Setting<Boolean> autoMend = sgMending.add(new BoolSetting.Builder()
-        .name("auto-mend")
-        .description("Tries to mend damaged elytra with XP bottles.")
-        .defaultValue(false)
-        .onChanged(this::onAutoMendChanged)
-        .build()
-    );
-
-    private final Setting<Keybind> autoMendToggleKey = sgMending.add(new KeybindSetting.Builder()
-        .name("toggle-key")
-        .description("Key to toggle auto mending.")
+    private final Setting<Keybind> rocketReplenishKey = sgRocketReplenish.add(new KeybindSetting.Builder()
+        .name("replenish-key")
+        .description("Replenishes the target hotbar slot's item to its max stack size from the main inventory.")
         .defaultValue(Keybind.none())
+        .visible(() -> rocketReplenishEnabled.get() && replenishMode.get() == ReplenishMode.Bind)
         .action(() -> {
-            boolean newVal = !autoMend.get();
-            autoMend.set(newVal);
-            info("Auto Mend " + (newVal ? "enabled" : "disabled") + ".");
+            if (mc.currentScreen != null) return;
+            if (mc.player == null || mc.world == null) return;
+            if (!rocketReplenishEnabled.get()) return;
+            handleRocketReplenish(false);
         })
         .build()
     );
 
-    private final Setting<Integer> packetsPerBurst = sgMending.add(new IntSetting.Builder()
-        .name("packets-per-burst")
-        .description("How many XP bottles to throw per burst.")
-        .defaultValue(3)
-        .min(1)
-        .sliderMax(10)
-        .visible(autoMend::get)
-        .build()
-    );
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Constants
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    private final Setting<Integer> burstDelay = sgMending.add(new IntSetting.Builder()
-        .name("burst-delay")
-        .description("Ticks to wait between bursts.")
-        .defaultValue(3)
-        .min(0)
-        .sliderMax(20)
-        .visible(autoMend::get)
-        .build()
-    );
+    private static final int MIDDLE_CLICK_COOLDOWN = 5;
 
-    // Internal state
-    private int swapTimer = 0;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State — Auto Replace
+    // ═══════════════════════════════════════════════════════════════════════════
+
     private boolean noReplacementWarned = false;
-    private boolean noUsableElytraWarned = false;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State — Middle Click
+    // ═══════════════════════════════════════════════════════════════════════════
+
     private boolean wasMiddlePressed = false;
-    private int mendTimer = 0;
-    private int middleClickTimer = 0;
-    private int swingTimer = 0;
+    private int middleClickCooldown = 0;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Constructor
+    // ═══════════════════════════════════════════════════════════════════════════
 
     public ElytraAssistant() {
-        super(HuntingUtilities.CATEGORY, "elytra-assistant", "Smart elytra & rocket management.");
+        super(Tim.CATEGORY, "elytra-assistant", "Smart elytra and rocket management.");
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Lifecycle
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @Override
     public void onActivate() {
-        swapTimer = 0;
-        noReplacementWarned = false;
-        noUsableElytraWarned = false;
-        wasMiddlePressed = false;
-        mendTimer = 0;
-        middleClickTimer = 0;
-        swingTimer = 0;
+        resetAutoReplaceState();
+        resetMiddleClickState();
     }
+
+    private void resetAutoReplaceState() {
+        noReplacementWarned = false;
+    }
+
+    private void resetMiddleClickState() {
+        wasMiddlePressed = false;
+        middleClickCooldown = 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Event Handlers
+    // ═══════════════════════════════════════════════════════════════════════════
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
 
-        if (middleClickTimer > 0) middleClickTimer--;
-
-        // Middle Click Logic
-        if (middleClickAction.get() != MiddleClickAction.None) {
-            if (Input.isButtonPressed(GLFW.GLFW_MOUSE_BUTTON_MIDDLE)) {
-                if (!wasMiddlePressed && middleClickTimer == 0) {
-                    runMiddleClickAction();
-                    wasMiddlePressed = true;
-                    middleClickTimer = 5;
-                }
-            } else {
-                wasMiddlePressed = false;
-            }
-        }
-
-        if (autoSwing.get()) {
-            if (swingTimer <= 0) {
-                mc.player.swingHand(Hand.MAIN_HAND);
-                swingTimer = (int) (swingInterval.get() * 20);
-            } else {
-                swingTimer--;
-            }
-        }
-
-        if (swapTimer > 0) {
-            swapTimer--;
-            return;
-        }
-
-        // Priority: auto mend (can override normal behavior)
-        if (autoMend.get()) {
-            handleAutoMend();
-            return;
-        }
-
-        // Chestplate ↔ Elytra swap based on ground state
-        if (chestplateOnGround.get()) {
-            handleChestplateElytraSwitch();
-        }
-
-        // Normal durability-based auto-swap
-        if (autoSwap.get()) {
-            handleDurabilityAutoSwap();
-        }
+        handleMiddleClick();
+        handleAutoReplace();
+        handleAutoReplenish();
     }
 
-    private void handleChestplateElytraSwitch() {
-        // Prevent swapping to chestplate if RocketPilot is active (it needs Elytra)
-        if (Modules.get().get(RocketPilot.class).isActive()) return;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Auto Replace Feature
+    // ═══════════════════════════════════════════════════════════════════════════
 
-        ItemStack chest = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+    private void handleAutoReplace() {
+        if (!autoReplace.get()) return;
+        if (Modules.get().get(Mendbot.class).isActive()) return;
 
-        if (mc.player.isOnGround()) {
-            noUsableElytraWarned = false;
-            if (chest.isOf(Items.ELYTRA)) {
-                FindItemResult cp = InvUtils.find(stack ->
-                    stack.isOf(Items.NETHERITE_CHESTPLATE) || stack.isOf(Items.DIAMOND_CHESTPLATE));
-                if (cp.found()) {
-                    InvUtils.move().from(cp.slot()).toArmor(2);
-                    swapTimer = swapDelay.get();
-                }
-            }
-        } else {
-            // In air → want elytra with enough durability
-            if (!chest.isOf(Items.ELYTRA) || (autoSwap.get() && chest.getMaxDamage() - chest.getDamage() <= durabilityThreshold.get())) {
-                FindItemResult elytra = findUsableElytra();
-                if (elytra.found()) {
-                    InvUtils.move().from(elytra.slot()).toArmor(2);
-                    swapTimer = swapDelay.get();
-                    info("Equipped usable elytra.");
-                } else if (!noUsableElytraWarned) {
-                    warning("No usable elytra found in inventory!");
-                    noUsableElytraWarned = true;
-                }
-            }
-        }
-    }
+        ItemStack chestplate = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        if (!chestplate.isOf(Items.ELYTRA)) return;
 
-    private void handleDurabilityAutoSwap() {
-        ItemStack chest = mc.player.getEquippedStack(EquipmentSlot.CHEST);
-        if (!chest.isOf(Items.ELYTRA)) return;
-
-        int remaining = chest.getMaxDamage() - chest.getDamage();
-        if (remaining > durabilityThreshold.get()) {
+        int remainingDurability = getRemainingDurability(chestplate);
+        if (remainingDurability > durabilityThreshold.get()) {
             noReplacementWarned = false;
             return;
         }
 
-        FindItemResult replacement = findUsableElytra();
+        FindItemResult replacement = findBestReplacementElytra();
         if (replacement.found()) {
-            InvUtils.move().from(replacement.slot()).toArmor(2);
-            info("Auto-swapped low-durability elytra.");
-            swapTimer = swapDelay.get();
+            equipElytraSilently(replacement.slot());
+            warning("Elytra durability low! Replaced with fresh elytra.");
+            mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
             noReplacementWarned = false;
         } else if (!noReplacementWarned) {
             warning("No replacement elytra available!");
+            playWarningSound();
             noReplacementWarned = true;
         }
     }
 
-    private FindItemResult findUsableElytra() {
-        return InvUtils.find(stack ->
-            stack.isOf(Items.ELYTRA) &&
-            (stack.getMaxDamage() - stack.getDamage() > durabilityThreshold.get())
-        );
+    private FindItemResult findBestReplacementElytra() {
+        int bestSlot = -1;
+        int bestDurability = -1;
+
+        for (int i = 0; i < com.example.addon.utils.MinecraftCompat.mainStacks(mc.player.getInventory()).size(); i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (!isUsableElytra(stack)) continue;
+
+            int durability = getRemainingDurability(stack);
+            if (durability > bestDurability) {
+                bestSlot = i;
+                bestDurability = durability;
+            }
+        }
+
+        return bestSlot != -1
+            ? new FindItemResult(bestSlot, mc.player.getInventory().getStack(bestSlot).getCount())
+            : new FindItemResult(-1, 0);
     }
 
-    private void handleAutoMend() {
-        if (mendTimer > 0) {
-            mendTimer--;
-            return;
-        }
-
-        FindItemResult xp = InvUtils.find(Items.EXPERIENCE_BOTTLE);
-        if (!xp.found()) {
-            info("No more XP bottles — disabling auto-mend.");
-            autoMend.set(false);
-            return;
-        }
-
-        ItemStack chest = mc.player.getEquippedStack(EquipmentSlot.CHEST);
-        if (!chest.isOf(Items.ELYTRA) || !chest.isDamaged()) {
-            // Try to equip damaged one if possible
-            FindItemResult damaged = InvUtils.find(stack ->
-                stack.isOf(Items.ELYTRA) && stack.isDamaged()
-            );
-            if (damaged.found()) {
-                InvUtils.move().from(damaged.slot()).toArmor(2);
-                swapTimer = Math.max(swapDelay.get(), 10);
-            } else {
-                info("All Elytras mended!");
-                autoMend.set(false);
-            }
-            return;
-        }
-
-        Rotations.rotate(mc.player.getYaw(), 90, () -> {
-            if (xp.isHotbar()) {
-                InvUtils.swap(xp.slot(), true);
-                for (int i = 0; i < packetsPerBurst.get(); i++) {
-                    mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
-                }
-                InvUtils.swapBack();
-            } else {
-                int prevSlot = mc.player.getInventory().selectedSlot;
-                InvUtils.move().from(xp.slot()).toHotbar(prevSlot);
-                for (int i = 0; i < packetsPerBurst.get(); i++) {
-                    mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
-                }
-                InvUtils.move().from(prevSlot).to(xp.slot());
-            }
-        });
-        mendTimer = burstDelay.get();
+    private boolean isUsableElytra(ItemStack stack) {
+        return !stack.isEmpty()
+            && stack.isOf(Items.ELYTRA)
+            && getRemainingDurability(stack) > durabilityThreshold.get();
     }
 
-    private void runMiddleClickAction() {
+    private int getRemainingDurability(ItemStack elytra) {
+        return elytra.getMaxDamage() - elytra.getDamage();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Middle Click Feature
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void handleMiddleClick() {
+        if (middleClickCooldown > 0) middleClickCooldown--;
+
+        if (middleClickAction.get() == MiddleClickAction.None) return;
         if (mc.currentScreen != null) return;
 
-        MiddleClickAction action = middleClickAction.get();
-        FindItemResult itemResult = null;
+        boolean isPressed = Input.isButtonPressed(GLFW.GLFW_MOUSE_BUTTON_MIDDLE);
 
-        if (action == MiddleClickAction.Rocket) {
-            if (preventGroundUsage.get() && mc.player.isOnGround()) return;
-            itemResult = InvUtils.find(Items.FIREWORK_ROCKET);
-        } else if (action == MiddleClickAction.Pearl) {
-            itemResult = InvUtils.find(Items.ENDER_PEARL);
+        if (isPressed && !wasMiddlePressed && middleClickCooldown == 0) {
+            executeMiddleClickAction();
+            wasMiddlePressed = true;
+            middleClickCooldown = MIDDLE_CLICK_COOLDOWN;
+        } else if (!isPressed) {
+            wasMiddlePressed = false;
         }
+    }
 
-        if (itemResult == null || !itemResult.found()) return;
+    private void executeMiddleClickAction() {
+        MiddleClickAction action = middleClickAction.get();
 
-        int slot = itemResult.slot();
-        int prevSlot = mc.player.getInventory().selectedSlot;
+        if (mc.player.isOnGround()) return;
 
-        if (slot < 9) {
-            InvUtils.swap(slot, true);
+        ItemUsage target = switch (action) {
+            case Rocket -> new ItemUsage(Items.FIREWORK_ROCKET);
+            case Pearl  -> new ItemUsage(Items.ENDER_PEARL);
+            default     -> null;
+        };
+
+        if (target == null) return;
+        useItemFromInventory(target.item());
+    }
+
+    private void useItemFromInventory(Item item) {
+        FindItemResult result = InvUtils.find(item);
+        if (!result.found()) return;
+
+        int slot = result.slot();
+        int previousSlot = com.example.addon.utils.MinecraftCompat.selectedSlot(mc.player.getInventory());
+
+        if (isHotbarSlot(slot)) {
+            InvUtils.swap(slot, silentRocket.get());
             mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
             InvUtils.swapBack();
         } else {
-            InvUtils.move().from(slot).toHotbar(prevSlot);
-            InvUtils.swap(prevSlot, true);
+            InvUtils.move().from(slot).toHotbar(previousSlot);
+            InvUtils.swap(previousSlot, silentRocket.get());
             mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
             InvUtils.swapBack();
-            InvUtils.move().from(prevSlot).to(slot); // Corrected to use .to(slot)
-        }
-
-    }
-
-    private void onAutoSwapChanged(boolean v) {
-        if (v && autoMend != null && autoMend.get()) {
-            autoMend.set(false);
-            info("Auto Mend has been disabled as it conflicts with Auto Swap.");
+            InvUtils.move().from(previousSlot).to(slot);
         }
     }
 
-    private void onAutoMendChanged(boolean v) {
-        if (v && autoSwap != null && autoSwap.get()) {
-            autoSwap.set(false);
-            info("Auto Swap has been disabled as it conflicts with Auto Mend.");
+    private boolean isHotbarSlot(int slot) {
+        return slot >= 0 && slot < 9;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Rocket Replenish Feature
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void handleAutoReplenish() {
+        if (!rocketReplenishEnabled.get()) return;
+        if (replenishMode.get() != ReplenishMode.Automatic) return;
+        if (mc.currentScreen != null) return;
+
+        int selectedSlot = useSelectedSlot.get()
+            ? com.example.addon.utils.MinecraftCompat.selectedSlot(mc.player.getInventory())
+            : targetSlot.get() - 1;
+
+        ItemStack targetStack = mc.player.getInventory().getStack(selectedSlot);
+        
+        if (!targetStack.isEmpty() && !targetStack.isOf(Items.FIREWORK_ROCKET)) return;
+
+        int currentCount = targetStack.getCount();
+        if (currentCount <= autoThreshold.get()) {
+            handleRocketReplenish(true);
         }
     }
 
-    // Helper for addons to check if rocket should be blocked
+    private void handleRocketReplenish(boolean silent) {
+        int selectedSlot = useSelectedSlot.get()
+            ? com.example.addon.utils.MinecraftCompat.selectedSlot(mc.player.getInventory())
+            : targetSlot.get() - 1;
+
+        ItemStack targetStack = mc.player.getInventory().getStack(selectedSlot);
+        Item targetItem = Items.FIREWORK_ROCKET;
+
+        if (!targetStack.isEmpty() && targetStack.getItem() != targetItem) {
+            if (!silent) info("Target slot has a different item — cannot replenish.");
+            return;
+        }
+
+        if (!mc.player.currentScreenHandler.getCursorStack().isEmpty()) {
+            if (!silent) info("Cursor has an item — cannot replenish right now.");
+            return;
+        }
+
+        int maxCount = targetItem.getMaxCount();
+        int currentCount = targetStack.getCount();
+        int needed = maxCount - currentCount;
+
+        if (needed <= 0) {
+            if (!silent) info("Stack is already full (" + maxCount + ").");
+            return;
+        }
+
+        for (int i = 9; i < 36 && needed > 0; i++) {
+            ItemStack sourceStack = mc.player.getInventory().getStack(i);
+            if (sourceStack.isEmpty()) continue;
+            if (sourceStack.getItem() != targetItem) continue;
+
+            int available = sourceStack.getCount();
+            InvUtils.move().from(i).toHotbar(selectedSlot);
+            needed -= Math.min(needed, available);
+        }
+
+        int finalCount = maxCount - needed;
+
+        if (needed > 0) {
+            if (!silent) info("Replenished " + targetItem.getName().getString()
+                + " to " + finalCount + " (not enough items in inventory).");
+        } else {
+            if (!silent) info("Replenished " + targetItem.getName().getString()
+                + " to " + maxCount + ".");
+            mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Inventory Helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void equipElytraSilently(int slot) {
+        InvUtils.move().from(convertToInventorySlot(slot)).toArmor(2);
+    }
+
+    private int convertToInventorySlot(int hotbarSlot) {
+        return isHotbarSlot(hotbarSlot) ? 36 + hotbarSlot : hotbarSlot;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sound Helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private void playWarningSound() {
+        mc.player.playSound(
+            warningSoundType.get().toSoundEvent(),
+            warningSoundVolume.get().floatValue(),
+            1.0f
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Public API
+    // ═══════════════════════════════════════════════════════════════════════════
+
     public boolean shouldPreventRocketUse() {
-        return isActive() && preventGroundUsage.get() && mc.player.isOnGround();
+        return isActive() && mc.player.isOnGround();
     }
 
-    // Helper for addons to check silent mode
     public boolean shouldSilentRocket() {
         return isActive() && silentRocket.get();
     }
 
-    public boolean isAutoSwapEnabled() {
-        return isActive() && autoSwap.get();
+    public boolean isAutoReplaceEnabled() {
+        return isActive() && autoReplace.get();
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Inner Classes
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private record ItemUsage(Item item) {}
 }

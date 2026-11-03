@@ -1,6 +1,7 @@
 package com.example.addon.mixin;
 
 import com.example.addon.modules.PortalMaker;
+import com.example.addon.utils.MinecraftCompat;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockState;
@@ -74,7 +75,7 @@ public abstract class PortalMakerMixin {
         );
 
         // Only damage the item on the server (prevents double-damage desync)
-        if (!world.isClient && context.getPlayer() != null) {
+        if (!MinecraftCompat.isClient(world) && context.getPlayer() != null) {
             EquipmentSlot slot = context.getHand() == Hand.MAIN_HAND ? EquipmentSlot.MAINHAND : EquipmentSlot.OFFHAND;
             context.getStack().damage(1, context.getPlayer(), slot);
         }

@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "refmap": "Tim.refmap.json",
+  "package": "com.example.addon.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [],
+  "client": [
+    "RocketPilotInputMixin",
+    "ThirdSightMouseMixin",
+    "ClientPlayerEntityMixin",
+    "HandmoldMixin",
+    "HeldItemRendererAccessor",
+    "RocketPilotMixin",
+    "HandledScreenMouseMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

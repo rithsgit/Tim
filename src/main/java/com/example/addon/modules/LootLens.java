@@ -1,30 +1,43 @@
 package com.example.addon.modules;
 
-import com.example.addon.HuntingUtilities;
-import meteordevelopment.meteorclient.events.game.GameLeftEvent; // Import for disconnect event
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import com.example.addon.Tim;
+import com.example.addon.render.RenderCompat;
+
 import meteordevelopment.meteorclient.events.game.OpenScreenEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
-import meteordevelopment.meteorclient.settings.*;
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.ColorSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.ItemListSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
-import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.ChestBlock;
 import net.minecraft.block.ShulkerBoxBlock;
+import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.enums.ChestType;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
-import net.minecraft.entity.decoration.ItemFrameEntity;
-import net.minecraft.entity.decoration.GlowItemFrameEntity;
-import net.minecraft.entity.vehicle.ChestMinecartEntity;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
-import net.minecraft.item.Items;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.sound.SoundEvents;
@@ -32,891 +45,764 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
-import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.chunk.ChunkStatus;
 import net.minecraft.world.chunk.WorldChunk;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
 public class LootLens extends Module {
-    private final Map<BlockPos, StorageType> containers = new HashMap<>();
-    private final Set<BlockPos> checkedContainers = new HashSet<>();
-    private final Set<BlockPos> shulkerContainers = new HashSet<>();
-    private final Map<BlockPos, Integer> shulkerCounts = new HashMap<>();
-    private final Map<BlockPos, Integer> stackedMinecartCounts = new HashMap<>();
-    private final Map<Vec3d, ItemFrameEntity> itemFrameEntities = new HashMap<>();
-    private final Map<Vec3d, GlowItemFrameEntity> glowItemFrameEntities = new HashMap<>();
-    private final Set<Vec3d> notifiedItemFrames = new HashSet<>();
 
-    private BlockPos lastOpenedContainer = null;
+    public enum RenderMode { GLOW, SPECTRAL, PULSE }
+    public enum BeamStyle  { BOX, GUARDIAN }
+
+    private final Map<BlockPos, StorageType>      containers                 = new HashMap<>();
+    private final Set<BlockPos>                   inventoryCheckedContainers = new HashSet<>();
+    private final Set<BlockPos>                   scannedByScanner           = new HashSet<>();
+    private final Set<BlockPos>                   shulkerContainers          = new HashSet<>();
+    private final Map<BlockPos, Integer>          shulkerCounts              = new HashMap<>();
+
+    private BlockPos lastOpenedContainer    = null;
+    private boolean  screenInventoryChecked = false;
 
     private String lastDimension = "";
+    private static final int DIMENSION_CHANGE_COOLDOWN_TICKS = 40;
     private int dimensionChangeCooldown = 0;
 
-    private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgStorage = settings.createGroup("Storage");
-    private final SettingGroup sgUtility = settings.createGroup("Utility");
+    private static final int CLEANUP_INTERVAL = 40;
+    private int cleanupTimer = 0;
+
+    private final SettingGroup sgGeneral    = settings.getDefaultGroup();
+    private final SettingGroup sgStorage    = settings.createGroup("Storage");
+    private final SettingGroup sgUtility    = settings.createGroup("Utility");
     private final SettingGroup sgDecorative = settings.createGroup("Decorative");
+    private final SettingGroup sgBeam       = settings.createGroup("Beam");
 
-    // General Settings
     private final Setting<Integer> range = sgGeneral.add(new IntSetting.Builder()
-        .name("range")
-        .description("Container detection range in blocks.")
-        .defaultValue(128)
-        .min(16)
-        .max(512)
-        .sliderMin(32)
-        .sliderMax(256)
-        .build()
-    );
-
-    private final Setting<ShapeMode> shapeMode = sgGeneral.add(new EnumSetting.Builder<ShapeMode>()
-        .name("shape-mode")
-        .description("Render style.")
-        .defaultValue(ShapeMode.Both)
-        .build()
-    );
-
-    private final Setting<SettingColor> shulkerFoundColor = sgGeneral.add(new ColorSetting.Builder()
-        .name("shulker-found-color")
-        .description("Color for containers with shulkers found.")
-        .defaultValue(new SettingColor(0, 255, 0, 150))
-        .build()
-    );
-
-    private final Setting<Boolean> showBeam = sgGeneral.add(new BoolSetting.Builder()
-        .name("show-beam")
-        .description("Show beam above containers with shulkers.")
-        .defaultValue(true)
-        .build()
-    );
-
-    private final Setting<Integer> beamWidth = sgGeneral.add(new IntSetting.Builder()
-        .name("beam-width")
-        .description("Default beam width (in hundredths).")
-        .defaultValue(15)
-        .min(5)
-        .max(50)
-        .sliderMin(5)
-        .sliderMax(50)
-        .visible(showBeam::get)
-        .build()
+        .name("range").description("Container detection range in blocks.")
+        .defaultValue(128).min(16).max(512).sliderMin(32).sliderMax(256).build()
     );
 
     private final Setting<Boolean> notification = sgGeneral.add(new BoolSetting.Builder()
-        .name("notification")
-        .description("Send chat messages and play sound when shulkers are found.")
-        .defaultValue(true)
-        .build()
+        .name("notification").description("Send chat messages and play sound when shulkers are found.")
+        .defaultValue(true).build()
     );
 
     private final Setting<List<Item>> customItems = sgGeneral.add(new ItemListSetting.Builder()
-        .name("custom-items")
-        .description("Additional items to highlight in containers.")
-        .defaultValue(List.of(Items.ENCHANTED_GOLDEN_APPLE, Items.ELYTRA))
+        .name("custom-items").description("Additional items to highlight in containers.")
+        .defaultValue(List.of(Items.ENCHANTED_GOLDEN_APPLE, Items.ELYTRA)).build()
+    );
+
+    private final Setting<Boolean> stealDumpButtons = sgGeneral.add(new BoolSetting.Builder()
+        .name("steal-dump-buttons")
+        .description("Show steal and dump buttons on container screens.")
+        .defaultValue(true)
         .build()
     );
 
-    // --- Storage Settings ---
+    private final Setting<RenderMode> renderMode = sgGeneral.add(new EnumSetting.Builder<RenderMode>()
+        .name("render-mode")
+        .description("GLOW = layered bloom boxes. SPECTRAL = subtle fill. PULSE = fading in/out highlight.")
+        .defaultValue(RenderMode.GLOW).build()
+    );
+
+    private final Setting<Integer> glowLayers = sgGeneral.add(new IntSetting.Builder()
+        .name("glow-layers").description("Number of bloom layers rendered around each container.")
+        .defaultValue(4).min(1).sliderMax(8)
+        .visible(() -> renderMode.get() == RenderMode.GLOW || renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<Double> glowSpread = sgGeneral.add(new DoubleSetting.Builder()
+        .name("glow-spread").description("How far each bloom layer expands outward (in blocks).")
+        .defaultValue(0.04).min(0.01).sliderMax(0.15)
+        .visible(() -> renderMode.get() == RenderMode.GLOW || renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<Integer> glowBaseAlpha = sgGeneral.add(new IntSetting.Builder()
+        .name("glow-base-alpha").description("Alpha of the innermost glow layer (0-255).")
+        .defaultValue(60).min(10).sliderMax(150)
+        .visible(() -> renderMode.get() == RenderMode.GLOW).build()
+    );
+
+    private final Setting<Integer> spectralFillAlpha = sgGeneral.add(new IntSetting.Builder()
+        .name("spectral-fill-alpha")
+        .description("Fill alpha for block containers in SPECTRAL mode (0 = invisible, 40 = subtle).")
+        .defaultValue(40).min(0).max(200).sliderMax(120)
+        .visible(() -> renderMode.get() == RenderMode.SPECTRAL).build()
+    );
+
+    private final Setting<Boolean> spectralOutline = sgGeneral.add(new BoolSetting.Builder()
+        .name("spectral-outline").description("Draw a crisp outline around block containers in SPECTRAL mode.")
+        .defaultValue(true).visible(() -> renderMode.get() == RenderMode.SPECTRAL).build()
+    );
+
+    private final Setting<Double> pulseSpeed = sgGeneral.add(new DoubleSetting.Builder()
+        .name("pulse-speed")
+        .description("Pulse cycle speed. 1.0 = one full fade in/out per second.")
+        .defaultValue(1.0).min(0.1).max(5.0).sliderMax(3.0)
+        .visible(() -> renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<Integer> pulseMinAlpha = sgGeneral.add(new IntSetting.Builder()
+        .name("pulse-min-alpha")
+        .description("Lowest alpha reached during the pulse (0 = invisible).")
+        .defaultValue(15).min(0).max(255).sliderMax(100)
+        .visible(() -> renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<Integer> pulseMaxAlpha = sgGeneral.add(new IntSetting.Builder()
+        .name("pulse-max-alpha")
+        .description("Peak alpha reached during the pulse.")
+        .defaultValue(220).min(0).max(255).sliderMax(255)
+        .visible(() -> renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<Boolean> pulseBeams = sgGeneral.add(new BoolSetting.Builder()
+        .name("pulse-beams")
+        .description("Also pulse the beam opacity in sync with the highlights.")
+        .defaultValue(true)
+        .visible(() -> renderMode.get() == RenderMode.PULSE).build()
+    );
+
+    private final Setting<BeamStyle> beamStyle = sgBeam.add(new EnumSetting.Builder<BeamStyle>()
+        .name("beam-style")
+        .description("BOX = simple axis-aligned box beam. GUARDIAN = spinning guardian-style beam.")
+        .defaultValue(BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Integer> beamWidth = sgBeam.add(new IntSetting.Builder()
+        .name("beam-width").description("Box beam width (in hundredths of a block).")
+        .defaultValue(15).min(5).max(50).sliderMin(5).sliderMax(50)
+        .visible(() -> beamStyle.get() == BeamStyle.BOX).build()
+    );
+
+    private final Setting<Boolean> mergeBeams = sgBeam.add(new BoolSetting.Builder()
+        .name("merge-beams").description("Merge beams for nearby shulker containers to reduce clutter.")
+        .defaultValue(true).build()
+    );
+
+    private final Setting<Double> mergeDistance = sgBeam.add(new DoubleSetting.Builder()
+        .name("merge-distance").description("Distance within which beams are merged.")
+        .defaultValue(2.0).min(0).sliderMax(10).visible(mergeBeams::get).build()
+    );
+
+    private final Setting<Double> guardianBeamRadius = sgBeam.add(new DoubleSetting.Builder()
+        .name("guardian-radius")
+        .description("Radius of the guardian beam strands from centre (blocks).")
+        .defaultValue(0.08).min(0.01).max(0.6).sliderMax(0.3)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Integer> guardianStrands = sgBeam.add(new IntSetting.Builder()
+        .name("guardian-strands")
+        .description("Number of spinning flat quads that make up the beam (2-8).")
+        .defaultValue(4).min(2).max(8).sliderMax(8)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Double> guardianSpinSpeed = sgBeam.add(new DoubleSetting.Builder()
+        .name("guardian-spin-speed")
+        .description("How fast the beam rotates. 1.0 = one full revolution every ~6 seconds.")
+        .defaultValue(1.0).min(0.1).max(5.0).sliderMax(3.0)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Integer> guardianCoreAlpha = sgBeam.add(new IntSetting.Builder()
+        .name("guardian-core-alpha")
+        .description("Alpha of the solid centre core of the guardian beam (0 = no core).")
+        .defaultValue(90).min(0).max(255).sliderMax(200)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Integer> guardianStrandAlpha = sgBeam.add(new IntSetting.Builder()
+        .name("guardian-strand-alpha")
+        .description("Alpha of the outer spinning strands.")
+        .defaultValue(160).min(10).max(255).sliderMax(255)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Boolean> guardianGlow = sgBeam.add(new BoolSetting.Builder()
+        .name("guardian-glow")
+        .description("Add a soft bloom halo around the guardian beam.")
+        .defaultValue(true)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN).build()
+    );
+
+    private final Setting<Double> guardianGlowRadius = sgBeam.add(new DoubleSetting.Builder()
+        .name("guardian-glow-radius")
+        .description("Radius of the bloom halo around the guardian beam.")
+        .defaultValue(0.18).min(0.02).max(1.0).sliderMax(0.5)
+        .visible(() -> beamStyle.get() == BeamStyle.GUARDIAN && guardianGlow.get()).build()
+    );
+
     private final Setting<Boolean> scanChests = sgStorage.add(new BoolSetting.Builder()
-        .name("chests")
-        .description("Detect chests.")
+        .name("chests").description("Detect chests and trapped chests.")
         .defaultValue(true)
         .onChanged(v -> {
-            if (!v) removeContainersOfType(StorageType.CHEST);
-        })
-        .build()
+            if (!v) {
+                removeContainersOfType(StorageType.CHEST);
+                removeContainersOfType(StorageType.TRAPPED_CHEST);
+            }
+        }).build()
     );
     private final Setting<SettingColor> chestColor = sgStorage.add(new ColorSetting.Builder()
-        .name("chest-color")
-        .description("Chest highlight color.")
-        .defaultValue(new SettingColor(255, 215, 0, 38))
-        .visible(scanChests::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanTrappedChests = sgStorage.add(new BoolSetting.Builder()
-        .name("trapped-chests")
-        .description("Detect trapped chests.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> trappedChestColor = sgStorage.add(new ColorSetting.Builder()
-        .name("trapped-chest-color")
-        .description("Trapped chest highlight color.")
-        .defaultValue(new SettingColor(255, 69, 0, 38))
-        .visible(scanTrappedChests::get)
-        .build()
+        .name("chest-color").defaultValue(new SettingColor(255, 215, 0, 200))
+        .visible(scanChests::get).build()
     );
 
     private final Setting<Boolean> scanBarrels = sgStorage.add(new BoolSetting.Builder()
-        .name("barrels")
-        .description("Detect barrels.")
-        .defaultValue(true)
-        .build()
+        .name("barrels").description("Detect barrels.").defaultValue(true)
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.BARREL); }).build()
     );
     private final Setting<SettingColor> barrelColor = sgStorage.add(new ColorSetting.Builder()
-        .name("barrel-color")
-        .description("Barrel highlight color.")
-        .defaultValue(new SettingColor(139, 69, 19, 38))
-        .visible(scanBarrels::get)
-        .build()
+        .name("barrel-color").defaultValue(new SettingColor(139, 69, 19, 200))
+        .visible(scanBarrels::get).build()
     );
-    private final Setting<Boolean> scanChestMinecarts = sgStorage.add(new BoolSetting.Builder()
-        .name("chest-minecarts")
-        .description("Detect chest minecarts.")
+
+    private final Setting<Boolean> scanShulkerBoxes = sgStorage.add(new BoolSetting.Builder()
+        .name("shulker-boxes").description("Detect shulker boxes placed in the world.").defaultValue(true)
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.SHULKER_BOX); }).build()
+    );
+    private final Setting<SettingColor> shulkerBoxColor = sgStorage.add(new ColorSetting.Builder()
+        .name("shulker-box-color").defaultValue(new SettingColor(160, 32, 240, 200))
+        .visible(scanShulkerBoxes::get).build()
+    );
+
+    private final Setting<Boolean> scanEnderChests = sgStorage.add(new BoolSetting.Builder()
+        .name("ender-chests").description("Detect ender chests.").defaultValue(true)
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.ENDER_CHEST); }).build()
+    );
+    private final Setting<SettingColor> enderChestColor = sgStorage.add(new ColorSetting.Builder()
+        .name("ender-chest-color").defaultValue(new SettingColor(75, 0, 130, 200))
+        .visible(scanEnderChests::get).build()
+    );
+
+    private final Setting<SettingColor> shulkerFoundColor = sgStorage.add(new ColorSetting.Builder()
+        .name("shulker-found-color").description("Bright color for chests/barrels confirmed to hold shulkers or custom items.")
+        .defaultValue(new SettingColor(0, 255, 80, 255)).build()
+    );
+
+    private final Setting<Boolean> scanUtility = sgUtility.add(new BoolSetting.Builder()
+        .name("utility-blocks")
+        .description("Detect utility containers: furnaces, blast furnaces, smokers, hoppers, dispensers, and droppers.")
         .defaultValue(true)
-        .build()
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.UTILITY); }).build()
     );
-    private final Setting<SettingColor> chestMinecartColor = sgStorage.add(new ColorSetting.Builder()
-        .name("chest-minecart-color")
-        .description("Chest minecart highlight color.")
-        .defaultValue(new SettingColor(255, 180, 0, 38))
-        .visible(scanChestMinecarts::get)
-        .build()
+    private final Setting<SettingColor> utilityColor = sgUtility.add(new ColorSetting.Builder()
+        .name("utility-color")
+        .defaultValue(new SettingColor(150, 150, 150, 200))
+        .visible(scanUtility::get).build()
     );
-    
-    private final Setting<Boolean> highlightStacked = sgStorage.add(new BoolSetting.Builder()
-        .name("highlight-stacked-minecarts")
-        .description("Use different color for stacked chest minecarts (2+).")
+
+    private final Setting<Boolean> scanDecorative = sgDecorative.add(new BoolSetting.Builder()
+        .name("decorative-blocks")
+        .description("Detect decorative containers: brewing stands, crafters, chiseled bookshelves, and decorated pots.")
         .defaultValue(true)
-        .visible(scanChestMinecarts::get)
-        .build()
+        .onChanged(v -> { if (!v) removeContainersOfType(StorageType.DECORATIVE); }).build()
     );
-    
-    private final Setting<SettingColor> stackedMinecartColor = sgStorage.add(new ColorSetting.Builder()
-        .name("stacked-minecart-color")
-        .description("Highlight color for stacked chest minecarts.")
-        .defaultValue(new SettingColor(255, 0, 255, 100))
-        .visible(() -> scanChestMinecarts.get() && highlightStacked.get())
-        .build()
+    private final Setting<SettingColor> decorativeColor = sgDecorative.add(new ColorSetting.Builder()
+        .name("decorative-color")
+        .defaultValue(new SettingColor(180, 100, 220, 200))
+        .visible(scanDecorative::get).build()
     );
-
-    // --- Utility Settings ---
-    private final Setting<Boolean> scanFurnaces = sgUtility.add(new BoolSetting.Builder()
-        .name("furnaces")
-        .description("Detect furnaces, blast furnaces, and smokers.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> furnaceColor = sgUtility.add(new ColorSetting.Builder()
-        .name("furnace-color")
-        .description("Furnace highlight color.")
-        .defaultValue(new SettingColor(192, 192, 192, 38))
-        .visible(scanFurnaces::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanHoppers = sgUtility.add(new BoolSetting.Builder()
-        .name("hoppers")
-        .description("Detect hoppers.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> hopperColor = sgUtility.add(new ColorSetting.Builder()
-        .name("hopper-color")
-        .description("Hopper highlight color.")
-        .defaultValue(new SettingColor(64, 64, 64, 38))
-        .visible(scanHoppers::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanDispensers = sgUtility.add(new BoolSetting.Builder()
-        .name("dispensers")
-        .description("Detect dispensers.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> dispenserColor = sgUtility.add(new ColorSetting.Builder()
-        .name("dispenser-color")
-        .description("Dispenser highlight color.")
-        .defaultValue(new SettingColor(169, 169, 169, 38))
-        .visible(scanDispensers::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanDroppers = sgUtility.add(new BoolSetting.Builder()
-        .name("droppers")
-        .description("Detect droppers.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> dropperColor = sgUtility.add(new ColorSetting.Builder()
-        .name("dropper-color")
-        .description("Dropper highlight color.")
-        .defaultValue(new SettingColor(128, 128, 128, 38))
-        .visible(scanDroppers::get)
-        .build()
-    );
-
-    // --- Decorative Settings ---
-
-    private final Setting<Boolean> scanBrewingStands = sgDecorative.add(new BoolSetting.Builder()
-        .name("brewing-stands")
-        .description("Detect brewing stands.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> brewingStandColor = sgDecorative.add(new ColorSetting.Builder()
-        .name("brewing-stand-color")
-        .description("Brewing stand highlight color.")
-        .defaultValue(new SettingColor(138, 43, 226, 38))
-        .visible(scanBrewingStands::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanCrafters = sgDecorative.add(new BoolSetting.Builder()
-        .name("crafters")
-        .description("Detect crafters.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> crafterColor = sgDecorative.add(new ColorSetting.Builder()
-        .name("crafter-color")
-        .description("Crafter highlight color.")
-        .defaultValue(new SettingColor(160, 82, 45, 38))
-        .visible(scanCrafters::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanDecoratedPots = sgDecorative.add(new BoolSetting.Builder()
-        .name("decorated-pots")
-        .description("Detect decorated pots.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> decoratedPotColor = sgDecorative.add(new ColorSetting.Builder()
-        .name("decorated-pot-color")
-        .description("Decorated pot highlight color.")
-        .defaultValue(new SettingColor(205, 133, 63, 38))
-        .visible(scanDecoratedPots::get)
-        .build()
-    );
-
-    private final Setting<Boolean> scanItemFrames = sgDecorative.add(new BoolSetting.Builder()
-        .name("item-frames")
-        .description("Detect item frames and glow item frames with shulker boxes.")
-        .defaultValue(true)
-        .build()
-    );
-    private final Setting<SettingColor> itemFrameColor = sgDecorative.add(new ColorSetting.Builder()
-        .name("item-frame-color")
-        .description("Item frame highlight color (only shown when shulker inside).")
-        .defaultValue(new SettingColor(255, 100, 255, 150))
-        .visible(scanItemFrames::get)
-        .build()
-    );
-
-
 
     public LootLens() {
-        super(HuntingUtilities.CATEGORY, "loot-lens", "Highlights storage containers that hold shulkers.");
+        super(Tim.CATEGORY, "loot-lens", "Highlights storage containers confirmed to hold shulkers or custom items.");
     }
 
     @Override
     public void onActivate() {
-        containers.clear();
-        checkedContainers.clear();
-        shulkerContainers.clear();
-        shulkerCounts.clear();
-        stackedMinecartCounts.clear();
-        itemFrameEntities.clear();
-        glowItemFrameEntities.clear();
-        notifiedItemFrames.clear();
-        lastOpenedContainer = null;
-        
-        if (mc.player != null && mc.world != null) {
-            info("§bLoot Lens activated");
-            if (mc.world.getRegistryKey() != null) {
-                lastDimension = mc.world.getRegistryKey().getValue().toString();
-            }
-        }
+        clearAllState();
+        if (mc.player != null && mc.world != null && mc.world.getRegistryKey() != null)
+            lastDimension = mc.world.getRegistryKey().getValue().toString();
     }
 
     @Override
-    public void onDeactivate() {
-        containers.clear();
-        checkedContainers.clear();
-        shulkerContainers.clear();
-        shulkerCounts.clear();
-        stackedMinecartCounts.clear();
-        itemFrameEntities.clear();
-        glowItemFrameEntities.clear();
-        notifiedItemFrames.clear();
-        lastOpenedContainer = null;
-    }
+    public void onDeactivate() { clearAllState(); }
 
-    // Auto-disable on disconnect
-    @EventHandler
-    private void onGameLeft(GameLeftEvent event) {
-        if (this.isActive()) toggle();
+    private void clearAllState() {
+        containers.clear(); inventoryCheckedContainers.clear(); scannedByScanner.clear();
+        shulkerContainers.clear(); shulkerCounts.clear();
+        lastOpenedContainer = null; screenInventoryChecked = false; cleanupTimer = 0;
     }
 
     @EventHandler
-    private void onTick(TickEvent.Pre event) {
+    private void onTickPre(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
-
-        try {
-            if (mc.world.getRegistryKey() == null) return;
-        } catch (Exception e) { return; }
-
-        if (dimensionChangeCooldown > 0) {
-            dimensionChangeCooldown--;
-            return;
-        }
-
+        try { if (mc.world.getRegistryKey() == null) return; } catch (Exception e) { return; }
+        if (dimensionChangeCooldown > 0) { dimensionChangeCooldown--; return; }
         try {
             String currDim = mc.world.getRegistryKey().getValue().toString();
             if (!currDim.equals(lastDimension)) {
-                dimensionChangeCooldown = 0;
-                lastDimension = currDim;
-
-                containers.clear();
-                checkedContainers.clear();
-                shulkerContainers.clear();
-                shulkerCounts.clear();
-                stackedMinecartCounts.clear();
-                lastOpenedContainer = null;
-                return;
+                dimensionChangeCooldown = DIMENSION_CHANGE_COOLDOWN_TICKS;
+                lastDimension = currDim; clearAllState(); return;
             }
         } catch (Exception ignored) { return; }
-
+        if (++cleanupTimer >= CLEANUP_INTERVAL) { cleanupTimer = 0; cleanupDistantContainers(); }
         BlockPos currentPos = mc.player.getBlockPos();
-        cleanupDistantContainers();
-        scanChestMinecarts();
-        scanItemFrames();
-        
-        int centerChunkX = currentPos.getX() >> 4;
-        int centerChunkZ = currentPos.getZ() >> 4;
-        scanBlockEntities(centerChunkX, centerChunkZ);
-    }
-    
-    private void scanBlockEntities(int centerChunkX, int centerChunkZ) {
-        int rangeBlocks = range.get();
-        int chunkRange = (rangeBlocks >> 4) + 1;
-        int maxDistSq = rangeBlocks * rangeBlocks;
-        BlockPos playerPos = mc.player.getBlockPos();
-
-        for (int cx = centerChunkX - chunkRange; cx <= centerChunkX + chunkRange; cx++) {
-            for (int cz = centerChunkZ - chunkRange; cz <= centerChunkZ + chunkRange; cz++) {
-                int dx = cx - centerChunkX;
-                int dz = cz - centerChunkZ;
-                if (dx * dx + dz * dz > (chunkRange + 1) * (chunkRange + 1)) continue;
-
-                WorldChunk chunk = mc.world.getChunkManager().getChunk(cx, cz, ChunkStatus.FULL, false);
-                if (chunk == null) continue;
-
-                for (BlockEntity be : chunk.getBlockEntities().values()) {
-                    BlockPos pos = be.getPos();
-                    if (pos.getSquaredDistance(playerPos) > maxDistSq) continue;
-                    
-                    if (containers.containsKey(pos)) continue;
-                    if (checkedContainers.contains(pos) && !shulkerContainers.contains(pos)) continue;
-
-                    Block block = mc.world.getBlockState(pos).getBlock();
-                    StorageType type = null;
-
-                    if (block == Blocks.CHEST && scanChests.get()) type = StorageType.CHEST;
-                    else if (block == Blocks.TRAPPED_CHEST && scanTrappedChests.get()) type = StorageType.TRAPPED_CHEST;
-                    else if (block == Blocks.BARREL && scanBarrels.get()) type = StorageType.BARREL;
-                    else if (scanFurnaces.get() && (block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE || block == Blocks.SMOKER)) type = StorageType.FURNACE;
-                    else if (block == Blocks.DISPENSER && scanDispensers.get()) type = StorageType.DISPENSER;
-                    else if (block == Blocks.DROPPER && scanDroppers.get()) type = StorageType.DROPPER;
-                    else if (block == Blocks.HOPPER && scanHoppers.get()) type = StorageType.HOPPER;
-                    else if (block == Blocks.BREWING_STAND && scanBrewingStands.get()) type = StorageType.BREWING_STAND;
-                    else if (block == Blocks.CRAFTER && scanCrafters.get()) type = StorageType.CRAFTER;
-                    else if (block == Blocks.DECORATED_POT && scanDecoratedPots.get()) type = StorageType.DECORATED_POT;
-
-                    if (type != null) {
-                        containers.put(pos, type);
-                    }
-                }
-            }
-        }
-    }
-    
-    private void scanChestMinecarts() {
-        if (mc.player == null || mc.world == null || !scanChestMinecarts.get()) return;
-
-        BlockPos playerPos = mc.player.getBlockPos();
-        int scanRange = range.get();
-        Box searchBox = new Box(
-            playerPos.getX() - scanRange, playerPos.getY() - scanRange, playerPos.getZ() - scanRange,
-            playerPos.getX() + scanRange, playerPos.getY() + scanRange, playerPos.getZ() + scanRange
-        );
-
-        Map<BlockPos, Integer> minecartCountMap = new HashMap<>();
-        
-        for (ChestMinecartEntity minecart : mc.world.getEntitiesByClass(ChestMinecartEntity.class, searchBox, entity -> true)) {
-            BlockPos pos = minecart.getBlockPos();
-            minecartCountMap.put(pos, minecartCountMap.getOrDefault(pos, 0) + 1);
-            
-            if (!containers.containsKey(pos) || containers.get(pos) != StorageType.CHEST_MINECART) {
-                containers.put(pos, StorageType.CHEST_MINECART);
-            }
-        }
-        
-        stackedMinecartCounts.clear();
-        stackedMinecartCounts.putAll(minecartCountMap);
-        
-        containers.entrySet().removeIf(entry -> {
-            if (entry.getValue() == StorageType.CHEST_MINECART) {
-                BlockPos pos = entry.getKey();
-                if (!minecartCountMap.containsKey(pos)) {
-                    checkedContainers.remove(pos);
-                    shulkerContainers.remove(pos);
-                    shulkerCounts.remove(pos);
-                    stackedMinecartCounts.remove(pos);
-                    return true;
-                }
-            }
-            return false;
-        });
+        scanBlockEntities(currentPos.getX() >> 4, currentPos.getZ() >> 4);
     }
 
-    private void scanItemFrames() {
+    @EventHandler
+    private void onTickPost(TickEvent.Post event) {
         if (mc.player == null || mc.world == null) return;
-        if (!scanItemFrames.get()) return;
-
-        BlockPos playerPos = mc.player.getBlockPos();
-        int scanRange = range.get();
-        Box searchBox = new Box(
-            playerPos.getX() - scanRange, playerPos.getY() - scanRange, playerPos.getZ() - scanRange,
-            playerPos.getX() + scanRange, playerPos.getY() + scanRange, playerPos.getZ() + scanRange
-        );
-
-        // Clear old frame entities
-        itemFrameEntities.clear();
-        glowItemFrameEntities.clear();
-
-        // Scan for item frames (includes glow item frames)
-        for (ItemFrameEntity frame : mc.world.getEntitiesByClass(ItemFrameEntity.class, searchBox, entity -> true)) {
-            boolean isGlow = frame instanceof GlowItemFrameEntity;
-
-            ItemStack heldStack = frame.getHeldItemStack();
-            if (!heldStack.isEmpty()) {
-                boolean isShulker = heldStack.getItem() instanceof BlockItem blockItem && blockItem.getBlock() instanceof ShulkerBoxBlock;
-                boolean isCustom = customItems.get().contains(heldStack.getItem());
-
-                if (isShulker || isCustom) {
-                    Vec3d pos = frame.getPos();
-
-                    if (isGlow) {
-                        glowItemFrameEntities.put(pos, (GlowItemFrameEntity) frame);
-                    } else {
-                        itemFrameEntities.put(pos, frame);
-                    }
-
-                    // Notify if this is a new discovery
-                    if (!notifiedItemFrames.contains(pos)) {
-                        notifiedItemFrames.add(pos);
-                        if (notification.get()) {
-                            if (isShulker) {
-                                info("Shulker found, Beam has been lit.");
-                            } else {
-                                info("§aItem found, Look for the beam!");
-                            }
-                            mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
-                        }
-                    }
-                }
+        if (mc.currentScreen instanceof HandledScreen<?>
+                && !(mc.currentScreen instanceof InventoryScreen)
+                && lastOpenedContainer != null && !screenInventoryChecked) {
+            HandledScreen<?> screen = (HandledScreen<?>) mc.currentScreen;
+            if (containers.containsKey(lastOpenedContainer) || shulkerContainers.contains(lastOpenedContainer)) {
+                checkScreenInventoryForShulkers(screen); screenInventoryChecked = true;
             }
         }
-        
-        // Clean up notifications for frames that are no longer present
-        notifiedItemFrames.removeIf(pos -> 
-            !itemFrameEntities.containsKey(pos) && !glowItemFrameEntities.containsKey(pos)
-        );
+        if (mc.currentScreen == null && lastOpenedContainer != null) {
+            lastOpenedContainer = null; screenInventoryChecked = false;
+        }
     }
 
     @EventHandler
     private void onOpenScreen(OpenScreenEvent event) {
         if (mc.player == null || mc.world == null) return;
-        
+        screenInventoryChecked = false;
+        if (event.screen instanceof InventoryScreen) return;
         HitResult hitResult = mc.crosshairTarget;
-        if (hitResult != null && hitResult.getType() == HitResult.Type.BLOCK) {
-            BlockHitResult blockHit = (BlockHitResult) hitResult;
-            lastOpenedContainer = blockHit.getBlockPos();
-        }
+        if (hitResult != null && hitResult.getType() == HitResult.Type.BLOCK)
+            lastOpenedContainer = ((BlockHitResult) hitResult).getBlockPos();
     }
 
-    @EventHandler
-    private void onTick(TickEvent.Post event) {
-        if (mc.currentScreen instanceof HandledScreen<?> screen && lastOpenedContainer != null) {
-            if (containers.containsKey(lastOpenedContainer) || checkedContainers.contains(lastOpenedContainer)) {
-                checkScreenInventoryForShulkers(screen);
-                checkedContainers.add(lastOpenedContainer);
-            }
-        }
+    public void setLastInteractedPos(BlockPos pos) { lastOpenedContainer = pos; screenInventoryChecked = false; }
+    public void onOpenScreenPacket() { screenInventoryChecked = false; }
+
+    private boolean isImmediateHighlight(StorageType type) {
+        return switch (type) {
+            case SHULKER_BOX, ENDER_CHEST, UTILITY, DECORATIVE -> true;
+            case CHEST, TRAPPED_CHEST, BARREL -> false;
+        };
     }
 
     private void checkScreenInventoryForShulkers(HandledScreen<?> screen) {
         if (lastOpenedContainer == null) return;
-        
-        ScreenHandler handler = screen.getScreenHandler();
-        int shulkerCount = 0;
-        boolean previouslyHadShulker = shulkerContainers.contains(lastOpenedContainer);
-        
-        // Player inventory is typically the last 36 slots (hotbar + main)
+        if (mc.world != null && mc.world.getBlockState(lastOpenedContainer).getBlock() == Blocks.ENDER_CHEST) return;
+        ScreenHandler handler    = screen.getScreenHandler();
         int playerInventoryStart = handler.slots.size() - 36;
-        
-        for (int i = 0; i < handler.slots.size(); i++) {
-            if (i >= playerInventoryStart) break;
-            Slot slot = handler.slots.get(i);
-
-            ItemStack stack = slot.getStack();
-            if (!stack.isEmpty()) {
-                boolean isShulker = stack.getItem() instanceof BlockItem blockItem && blockItem.getBlock() instanceof ShulkerBoxBlock;
-                if (isShulker || customItems.get().contains(stack.getItem())) {
-                    shulkerCount++;
-                }
-            }
+        int shulkerCount         = 0;
+        boolean previouslyHad    = shulkerContainers.contains(lastOpenedContainer);
+        for (int i = 0; i < playerInventoryStart; i++) {
+            Slot slot = handler.slots.get(i); ItemStack stack = slot.getStack();
+            if (stack.isEmpty()) continue;
+            boolean isShulker = stack.getItem() instanceof BlockItem bi && bi.getBlock() instanceof ShulkerBoxBlock;
+            if (isShulker || customItems.get().contains(stack.getItem())) shulkerCount++;
         }
-        
-        boolean hasShulker = shulkerCount > 0;
-        BlockPos adjacentChest = findAdjacentChest(lastOpenedContainer, false);
-        
-        if (hasShulker) {
-            if (!previouslyHadShulker) {
-                shulkerContainers.add(lastOpenedContainer);
-                shulkerCounts.put(lastOpenedContainer, shulkerCount);
-                if (adjacentChest != null) {
-                    shulkerContainers.add(adjacentChest);
-                    shulkerCounts.put(adjacentChest, shulkerCount);
-                    checkedContainers.add(adjacentChest);
-                }
+        StorageType type = containers.get(lastOpenedContainer);
+        if (type != null && isImmediateHighlight(type)) return;
 
-                if (notification.get()) {
-                    mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
-                    info("§a" + shulkerCount + (shulkerCount == 1 ? " Item" : " Items") + " found!");
-                }
-            } else {
-                shulkerCounts.put(lastOpenedContainer, shulkerCount);
-                if (adjacentChest != null) {
-                    shulkerCounts.put(adjacentChest, shulkerCount);
-                }
+        inventoryCheckedContainers.add(lastOpenedContainer);
+
+        BlockPos adjacentChest = findAdjacentChest(lastOpenedContainer, false);
+        if (adjacentChest != null) inventoryCheckedContainers.add(adjacentChest);
+
+        if (shulkerCount > 0) {
+            shulkerContainers.add(lastOpenedContainer);
+            shulkerCounts.put(lastOpenedContainer, shulkerCount);
+            if (adjacentChest != null) { shulkerContainers.add(adjacentChest); shulkerCounts.put(adjacentChest, shulkerCount); }
+            if (!previouslyHad && notification.get()) {
+                mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
+                info("%d %s found!", shulkerCount, shulkerCount == 1 ? "item" : "items");
             }
         } else {
-            checkedContainers.add(lastOpenedContainer);
             containers.remove(lastOpenedContainer);
             shulkerContainers.remove(lastOpenedContainer);
             shulkerCounts.remove(lastOpenedContainer);
+            if (adjacentChest != null) { containers.remove(adjacentChest); shulkerContainers.remove(adjacentChest); shulkerCounts.remove(adjacentChest); }
+            if (previouslyHad && notification.get()) info("0 items found, removing highlight.");
+        }
+    }
 
-            if (adjacentChest != null) {
-                checkedContainers.add(adjacentChest);
-                containers.remove(adjacentChest);
-                shulkerContainers.remove(adjacentChest);
-                shulkerCounts.remove(adjacentChest);
-            }
-
-            // Only notify if the container previously had shulkers
-            if (notification.get() && previouslyHadShulker) {
-                info("§70 items found, removing highlight.");
+    private void scanBlockEntities(int centerChunkX, int centerChunkZ) {
+        int rangeBlocks  = range.get();
+        int chunkRange   = (rangeBlocks >> 4) + 1;
+        int chunkRangeSq = chunkRange * chunkRange;
+        int maxDistSq    = rangeBlocks * rangeBlocks;
+        BlockPos playerPos = mc.player.getBlockPos();
+        for (int cx = centerChunkX - chunkRange; cx <= centerChunkX + chunkRange; cx++) {
+            for (int cz = centerChunkZ - chunkRange; cz <= centerChunkZ + chunkRange; cz++) {
+                int dx = cx - centerChunkX, dz = cz - centerChunkZ;
+                if (dx * dx + dz * dz > chunkRangeSq) continue;
+                WorldChunk chunk = mc.world.getChunkManager().getChunk(cx, cz, ChunkStatus.FULL, false);
+                if (chunk == null) continue;
+                for (BlockEntity be : chunk.getBlockEntities().values()) {
+                    BlockPos pos = be.getPos();
+                    if (pos.getSquaredDistance(playerPos) > maxDistSq) continue;
+                    if (scannedByScanner.contains(pos)
+                            && !shulkerContainers.contains(pos)
+                            && !inventoryCheckedContainers.contains(pos)) continue;
+                    Block block = mc.world.getBlockState(pos).getBlock();
+                    StorageType type = classifyBlock(block);
+                    if (type != null) { containers.put(pos, type); scannedByScanner.add(pos); }
+                }
             }
         }
     }
-    
+
+    private StorageType classifyBlock(Block block) {
+        if (block == Blocks.CHEST         && scanChests.get())        return StorageType.CHEST;
+        if (block == Blocks.TRAPPED_CHEST && scanChests.get())        return StorageType.TRAPPED_CHEST;
+        if (block == Blocks.BARREL        && scanBarrels.get())       return StorageType.BARREL;
+        if (block == Blocks.ENDER_CHEST   && scanEnderChests.get())   return StorageType.ENDER_CHEST;
+        if (block instanceof ShulkerBoxBlock && scanShulkerBoxes.get()) return StorageType.SHULKER_BOX;
+        if (scanUtility.get() && (block == Blocks.FURNACE
+                || block == Blocks.BLAST_FURNACE || block == Blocks.SMOKER
+                || block == Blocks.HOPPER
+                || block == Blocks.DISPENSER
+                || block == Blocks.DROPPER))                          return StorageType.UTILITY;
+        if (scanDecorative.get() && (block == Blocks.BREWING_STAND
+                || block == Blocks.CRAFTER
+                || block == Blocks.CHISELED_BOOKSHELF
+                || block == Blocks.DECORATED_POT))                    return StorageType.DECORATIVE;
+        return null;
+    }
+
     private BlockPos findAdjacentChest(BlockPos pos, boolean checkContainers) {
         if (mc.world == null) return null;
-        
         BlockState state = mc.world.getBlockState(pos);
-        Block block = state.getBlock();
-        
-        if (!(block instanceof ChestBlock)) return null;
-        
+        if (!(state.getBlock() instanceof ChestBlock)) return null;
         try {
             ChestType chestType = state.get(ChestBlock.CHEST_TYPE);
-            if (chestType == ChestType.SINGLE) return null; 
-            
-            Direction facing = state.get(ChestBlock.FACING);
-            
-            Direction neighborDirection;
-            if (chestType == ChestType.LEFT) {
-                neighborDirection = facing.rotateYClockwise();
-            } else {
-                neighborDirection = facing.rotateYCounterclockwise();
-            }
-            
-            BlockPos neighborPos = pos.offset(neighborDirection);
-            
+            if (chestType == ChestType.SINGLE) return null;
+            Direction facing      = state.get(ChestBlock.FACING);
+            Direction neighborDir = chestType == ChestType.LEFT
+                ? facing.rotateYClockwise() : facing.rotateYCounterclockwise();
+            BlockPos   neighborPos   = pos.offset(neighborDir);
             BlockState neighborState = mc.world.getBlockState(neighborPos);
-            if (neighborState.getBlock() == block) {
-                try {
-                    ChestType neighborChestType = neighborState.get(ChestBlock.CHEST_TYPE);
-                    Direction neighborFacing = neighborState.get(ChestBlock.FACING);
-                    
-                    if (neighborFacing == facing && neighborChestType != ChestType.SINGLE && neighborChestType != chestType) {
-                        if (!checkContainers || containers.containsKey(neighborPos)) {
-                            return neighborPos;
-                        }
-                    }
-                } catch (Exception ignored) {}
-            }
-        } catch (Exception ignored) {}
-        
-        return null;
+            if (!(neighborState.getBlock() instanceof ChestBlock)) return null;
+            ChestType  neighborType   = neighborState.get(ChestBlock.CHEST_TYPE);
+            Direction  neighborFacing = neighborState.get(ChestBlock.FACING);
+            if (neighborFacing != facing || neighborType == ChestType.SINGLE || neighborType == chestType) return null;
+            if (checkContainers && !containers.containsKey(neighborPos)) return null;
+            return neighborPos;
+        } catch (Exception ignored) { return null; }
     }
 
     private void removeContainersOfType(StorageType type) {
         containers.entrySet().removeIf(entry -> {
-            if (entry.getValue() == type) {
-                BlockPos pos = entry.getKey();
-                checkedContainers.remove(pos);
-                shulkerContainers.remove(pos);
-                shulkerCounts.remove(pos);
-                if (type == StorageType.CHEST_MINECART) {
-                    stackedMinecartCounts.remove(pos);
-                }
-                return true;
-            }
-            return false;
+            if (entry.getValue() != type) return false;
+            BlockPos pos = entry.getKey();
+            inventoryCheckedContainers.remove(pos); scannedByScanner.remove(pos);
+            shulkerContainers.remove(pos); shulkerCounts.remove(pos);
+            return true;
         });
     }
 
     private void cleanupDistantContainers() {
         if (mc.player == null) return;
-        
         BlockPos playerPos = mc.player.getBlockPos();
-        int cleanupRange = (int)(range.get() * 1.5);
-        int cleanupRangeSquared = cleanupRange * cleanupRange;
-        
+        int cleanupRange   = range.get() + (range.get() >> 1);
+        int cleanupRangeSq = cleanupRange * cleanupRange;
+
         containers.entrySet().removeIf(entry -> {
-            boolean tooFar = entry.getKey().getSquaredDistance(playerPos) > cleanupRangeSquared;
-            if (tooFar) {
-                checkedContainers.remove(entry.getKey());
-                shulkerContainers.remove(entry.getKey());
-                shulkerCounts.remove(entry.getKey());
-            }
-            return tooFar;
+            if (entry.getKey().getSquaredDistance(playerPos) <= cleanupRangeSq) return false;
+            BlockPos pos = entry.getKey();
+            inventoryCheckedContainers.remove(pos); scannedByScanner.remove(pos);
+            shulkerContainers.remove(pos); shulkerCounts.remove(pos);
+            return true;
         });
-    }
-
-    private void renderItemFrames(Render3DEvent event) {
-        if (mc.player == null || mc.world == null) return;
-        // Use the beamWidth setting (in hundredths) for adjustable beam thickness
-        double beamSize = beamWidth.get() / 100.0;
-
-        // Render regular item frames
-        for (Map.Entry<Vec3d, ItemFrameEntity> entry : itemFrameEntities.entrySet()) {
-            ItemFrameEntity frame = entry.getValue();
-            if (frame == null || frame.isRemoved()) continue;
-
-            Box box = frame.getBoundingBox();
-            SettingColor color = itemFrameColor.get();
-            
-            // Highlight the item frame
-            event.renderer.box(box, color, color, ShapeMode.Both, 0);
-            
-            // Draw beam if enabled - using a box for better visibility
-            if (showBeam.get()) {
-                Vec3d pos = frame.getPos();
-                Box beamBox = new Box(
-                    pos.x - beamSize, pos.y, pos.z - beamSize,
-                    pos.x + beamSize, pos.y + 256, pos.z + beamSize
-                );
-                event.renderer.box(beamBox, color, color, ShapeMode.Both, 0);
-            }
-        }
-
-        // Render glow item frames
-        for (Map.Entry<Vec3d, GlowItemFrameEntity> entry : glowItemFrameEntities.entrySet()) {
-            GlowItemFrameEntity frame = entry.getValue();
-            if (frame == null || frame.isRemoved()) continue;
-
-            Box box = frame.getBoundingBox();
-            SettingColor color = itemFrameColor.get();
-            
-            // Highlight the item frame
-            event.renderer.box(box, color, color, ShapeMode.Both, 0);
-            
-            // Draw beam if enabled - using a box for better visibility
-            if (showBeam.get()) {
-                Vec3d pos = frame.getPos();
-                Box beamBox = new Box(
-                    pos.x - beamSize, pos.y, pos.z - beamSize,
-                    pos.x + beamSize, pos.y + 256, pos.z + beamSize
-                );
-                event.renderer.box(beamBox, color, color, ShapeMode.Both, 0);
-            }
-        }
     }
 
     @EventHandler
     private void onRender(Render3DEvent event) {
         if (mc.player == null || mc.world == null) return;
+        boolean isSpectral = renderMode.get() == RenderMode.SPECTRAL;
+        boolean isPulse    = renderMode.get() == RenderMode.PULSE;
+        Set<BlockPos>  toRemove             = new HashSet<>();
+        Set<BlockPos>  renderedDoubleChests = new HashSet<>();
+        List<BeamData> beamsToRender        = new ArrayList<>();
 
-        ShapeMode mode = shapeMode.get();
-        Set<BlockPos> toRemove = new HashSet<>();
-        Set<BlockPos> renderedDoubleChests = new HashSet<>();
-        
-        // Render item frames with shulker boxes
-        renderItemFrames(event);
-        
-        if (containers.isEmpty()) return;
-        
         for (Map.Entry<BlockPos, StorageType> entry : containers.entrySet()) {
-            BlockPos pos = entry.getKey();
+            BlockPos    pos  = entry.getKey();
             StorageType type = entry.getValue();
-            
+
+            boolean shouldRender = isImmediateHighlight(type) || shulkerContainers.contains(pos);
+            if (!shouldRender) continue;
+
             if (renderedDoubleChests.contains(pos)) continue;
-            
+
             Box renderBox;
-            
-            if (type == StorageType.CHEST_MINECART) {
-                List<ChestMinecartEntity> minecarts = mc.world.getEntitiesByClass(ChestMinecartEntity.class, new Box(pos), entity -> true);
-                
-                if (!minecarts.isEmpty()) {
-                    renderBox = minecarts.get(0).getBoundingBox();
-                } else {
-                    toRemove.add(pos);
-                    continue;
-                }
-            }
-            else {
-                Block currentBlock = mc.world.getBlockState(pos).getBlock();
-                boolean blockStillExists = validateBlockType(currentBlock, type);
-                
-                if (!blockStillExists) {
-                    toRemove.add(pos);
-                    continue;
-                }
-                
-                BlockPos adjacentPos = findAdjacentChest(pos, true);
-                if (adjacentPos != null) {
-                    renderBox = createPaddedDoubleChestBox(pos, adjacentPos);
-                    renderedDoubleChests.add(adjacentPos);
-                } else {
-                    renderBox = createPaddedBox(pos);
-                }
-            }
+            SettingColor baseColor;
 
-            SettingColor color;
-            
-            if (shulkerContainers.contains(pos)) {
-                color = shulkerFoundColor.get();
-                event.renderer.box(renderBox, color, color, ShapeMode.Both, 0);
+            BlockState currentState = mc.world.getBlockState(pos);
+            if (!validateBlockType(currentState.getBlock(), type)) { toRemove.add(pos); continue; }
+            BlockPos adjacentPos = findAdjacentChest(pos, true);
+            if (adjacentPos != null) {
+                renderBox = createPaddedDoubleChestBox(pos, adjacentPos);
+                renderedDoubleChests.add(adjacentPos);
+            } else if (type == StorageType.SHULKER_BOX) {
+                renderBox = createShulkerBox(pos, currentState);
             } else {
-                boolean isStacked = type == StorageType.CHEST_MINECART && highlightStacked.get() && 
-                                   stackedMinecartCounts.getOrDefault(pos, 0) >= 2;
-                
-                if (isStacked) {
-                    color = stackedMinecartColor.get();
-                    event.renderer.box(renderBox, color, color, ShapeMode.Both, 0);
-                } else {
-                    color = getColor(entry.getValue());
-                    if (color != null) {
-                        event.renderer.box(renderBox, color, color, mode, 0);
-                    }
-                }
+                renderBox = createPaddedBox(pos);
+            }
+            baseColor = isImmediateHighlight(type) ? getColor(type) : shulkerFoundColor.get();
+
+            if (isSpectral) {
+                int fillAlpha = spectralFillAlpha.get();
+                int lineAlpha = (!spectralOutline.get()) ? 0 : baseColor.a;
+                event.renderer.box(renderBox, withAlpha(baseColor, fillAlpha), withAlpha(baseColor, lineAlpha),
+                    spectralOutline.get() ? ShapeMode.Both : ShapeMode.Sides, 0);
+            } else if (isPulse) {
+                renderPulseBox(event, renderBox, baseColor);
+            } else {
+                renderGlowLayers(event, renderBox, baseColor);
+                event.renderer.box(renderBox, withAlpha(baseColor, 0), baseColor, ShapeMode.Lines, 0);
             }
 
+            boolean shouldBeam = type != StorageType.UTILITY && type != StorageType.DECORATIVE && type != StorageType.ENDER_CHEST;
+
+            if (shouldBeam) {
+                SettingColor beamColor = (isPulse && pulseBeams.get()) ? pulseColor(baseColor) : baseColor;
+                beamsToRender.add(new BeamData(renderBox, beamColor));
+            }
         }
+
+        renderBeams(event, beamsToRender);
 
         if (!toRemove.isEmpty()) {
             for (BlockPos removePos : toRemove) {
-                containers.remove(removePos);
-                checkedContainers.remove(removePos);
-                shulkerContainers.remove(removePos);
+                containers.remove(removePos); inventoryCheckedContainers.remove(removePos);
+                scannedByScanner.remove(removePos); shulkerContainers.remove(removePos);
                 shulkerCounts.remove(removePos);
             }
         }
     }
-    
+
+    private void renderGlowLayers(Render3DEvent event, Box box, SettingColor color) {
+        int layers = glowLayers.get(); double spread = glowSpread.get(); int baseAlpha = glowBaseAlpha.get();
+        for (int i = layers; i >= 1; i--) {
+            double expansion = spread * i; double t = (double)(i - 1) / layers;
+            int layerAlpha = Math.max(4, (int)(baseAlpha * (1.0 - t * t)));
+            event.renderer.box(box.expand(expansion), withAlpha(color, layerAlpha),
+                withAlpha(color, 0), ShapeMode.Sides, 0);
+        }
+    }
+
+    private float getPulseFactor() {
+        double speed = pulseSpeed.get();
+        double t = System.currentTimeMillis() / 1000.0;
+        double phase = t * speed * Math.PI * 2.0;
+        return (float)((Math.sin(phase) + 1.0) * 0.5);
+    }
+
+    private int applyPulse(int baseAlpha) {
+        float f = getPulseFactor();
+        int min = pulseMinAlpha.get();
+        int max = pulseMaxAlpha.get();
+        return Math.min(255, Math.max(0, (int)(min + (max - min) * f)));
+    }
+
+    private SettingColor pulseColor(SettingColor base) {
+        return withAlpha(base, applyPulse(base.a));
+    }
+
+    private void renderPulseBox(Render3DEvent event, Box box, SettingColor base) {
+        int pa = applyPulse(base.a);
+        SettingColor pColor = withAlpha(base, pa);
+        int layers = glowLayers.get();
+        double spread = glowSpread.get();
+        for (int i = layers; i >= 1; i--) {
+            double expansion = spread * i;
+            double taper = 1.0 - ((double)(i - 1) / layers) * 0.6;
+            int layerAlpha = Math.max(4, (int)(pa * taper));
+            event.renderer.box(box.expand(expansion),
+                withAlpha(pColor, layerAlpha), withAlpha(pColor, 0), ShapeMode.Sides, 0);
+        }
+        event.renderer.box(box, withAlpha(pColor, pa / 3), pColor, ShapeMode.Both, 0);
+    }
+
+    private void renderBeams(Render3DEvent event, List<BeamData> beams) {
+        if (beams.isEmpty()) return;
+        if (mergeBeams.get()) {
+            List<BeamData> merged = new ArrayList<>();
+            double distSq = Math.pow(mergeDistance.get(), 2);
+            for (BeamData beam : beams) {
+                boolean skip = false;
+                double bx = (beam.box.minX + beam.box.maxX) / 2.0;
+                double bz = (beam.box.minZ + beam.box.maxZ) / 2.0;
+                for (BeamData m : merged) {
+                    double mx = (m.box.minX + m.box.maxX) / 2.0;
+                    double mz = (m.box.minZ + m.box.maxZ) / 2.0;
+                    if (Math.pow(bx - mx, 2) + Math.pow(bz - mz, 2) <= distSq) { skip = true; break; }
+                }
+                if (!skip) merged.add(beam);
+            }
+            beams = merged;
+        }
+        for (BeamData beam : beams) {
+            if (beamStyle.get() == BeamStyle.GUARDIAN) renderGuardianBeam(event, beam.box, beam.color);
+            else                                        renderBoxBeam(event, beam.box, beam.color);
+        }
+    }
+
+    private void renderBoxBeam(Render3DEvent event, Box anchorBox, SettingColor color) {
+        double beamSize = beamWidth.get() / 100.0;
+        double centerX  = (anchorBox.minX + anchorBox.maxX) / 2.0;
+        double centerZ  = (anchorBox.minZ + anchorBox.maxZ) / 2.0;
+        int    worldBot = mc.world.getBottomY();
+        int    worldTop = worldBot + mc.world.getHeight();
+        Box beamBox = new Box(
+            centerX - beamSize, worldBot, centerZ - beamSize,
+            centerX + beamSize, worldTop, centerZ + beamSize);
+        event.renderer.box(beamBox, withAlpha(color, 80), color, ShapeMode.Both, 0);
+        for (int i = 1; i <= 2; i++) {
+            double exp   = beamSize * i * 1.5;
+            int    alpha = Math.max(4, 30 / i);
+            Box bloom = new Box(
+                centerX - beamSize - exp, worldBot, centerZ - beamSize - exp,
+                centerX + beamSize + exp, worldTop, centerZ + beamSize + exp);
+            event.renderer.box(bloom, withAlpha(color, alpha), withAlpha(color, 0), ShapeMode.Sides, 0);
+        }
+    }
+
+    private void renderGuardianBeam(Render3DEvent event, Box anchorBox, SettingColor color) {
+        if (mc.world == null) return;
+
+        double cx = (anchorBox.minX + anchorBox.maxX) / 2.0;
+        double cz = (anchorBox.minZ + anchorBox.maxZ) / 2.0;
+        int worldBot = mc.world.getBottomY();
+        int worldTop = worldBot + mc.world.getHeight();
+
+        double radius  = guardianBeamRadius.get();
+        int    strands = guardianStrands.get();
+        double speed   = guardianSpinSpeed.get();
+
+        double rotationRad = (System.currentTimeMillis() % (long)(6000.0 / speed))
+                             / (6000.0 / speed) * Math.PI * 2.0;
+
+        RenderCompat.renderGuardianBeam(event, cx, cz, worldBot, worldTop, radius,
+            strands, rotationRad, color, guardianStrandAlpha.get());
+
+        int coreAlpha = guardianCoreAlpha.get();
+        if (coreAlpha > 0) {
+            double coreR = radius * 0.25;
+            Box coreBox = new Box(
+                cx - coreR, worldBot, cz - coreR,
+                cx + coreR, worldTop, cz + coreR);
+            event.renderer.box(coreBox,
+                withAlpha(color, coreAlpha),
+                withAlpha(color, Math.min(255, coreAlpha + 40)),
+                ShapeMode.Both, 0);
+        }
+
+        if (guardianGlow.get()) {
+            double glowR = guardianGlowRadius.get();
+            for (int ring = 1; ring <= 2; ring++) {
+                double expansion = glowR * ring;
+                int    alpha     = Math.max(4, 22 / ring);
+                Box bloomBox = new Box(
+                    cx - radius - expansion, worldBot, cz - radius - expansion,
+                    cx + radius + expansion, worldTop, cz + radius + expansion);
+                event.renderer.box(bloomBox,
+                    withAlpha(color, alpha),
+                    withAlpha(color, 0),
+                    ShapeMode.Sides, 0);
+            }
+        }
+    }
+
+    private SettingColor withAlpha(SettingColor color, int alpha) {
+        return new SettingColor(color.r, color.g, color.b, Math.min(255, Math.max(0, alpha)));
+    }
+
     private Box createPaddedBox(BlockPos pos) {
-        double padding = 0.0625; 
-        
-        return new Box(
-            pos.getX() + padding,
-            pos.getY() + padding,
-            pos.getZ() + padding,
-            pos.getX() + 1.0 - padding,
-            pos.getY() + 1.0 - padding,
-            pos.getZ() + 1.0 - padding
-        );
+        double p = 0.0625;
+        return new Box(pos.getX()+p, pos.getY()+p, pos.getZ()+p,
+                       pos.getX()+1-p, pos.getY()+1-p, pos.getZ()+1-p);
     }
-    
+
+    private Box createShulkerBox(BlockPos pos, BlockState state) {
+        try {
+            Box shape = state.getOutlineShape(mc.world, pos).getBoundingBox(); double p = 0.5 / 16.0;
+            return new Box(pos.getX()+shape.minX-p, pos.getY()+shape.minY-p, pos.getZ()+shape.minZ-p,
+                           pos.getX()+shape.maxX+p, pos.getY()+shape.maxY+p, pos.getZ()+shape.maxZ+p);
+        } catch (Exception ignored) { return createPaddedBox(pos); }
+    }
+
     private Box createPaddedDoubleChestBox(BlockPos pos1, BlockPos pos2) {
-        double minX = Math.min(pos1.getX(), pos2.getX());
-        double minY = Math.min(pos1.getY(), pos2.getY());
-        double minZ = Math.min(pos1.getZ(), pos2.getZ());
-        double maxX = Math.max(pos1.getX(), pos2.getX()) + 1;
-        double maxY = Math.max(pos1.getY(), pos2.getY()) + 1;
-        double maxZ = Math.max(pos1.getZ(), pos2.getZ()) + 1;
-        
-        double padding = 0.0625; 
-        
-        return new Box(
-            minX + padding,
-            minY + padding,
-            minZ + padding,
-            maxX - padding,
-            maxY - padding,
-            maxZ - padding
-        );
+        double p = 0.0625;
+        double minX = Math.min(pos1.getX(), pos2.getX()), minY = Math.min(pos1.getY(), pos2.getY()),
+               minZ = Math.min(pos1.getZ(), pos2.getZ());
+        double maxX = Math.max(pos1.getX(), pos2.getX())+1, maxY = Math.max(pos1.getY(), pos2.getY())+1,
+               maxZ = Math.max(pos1.getZ(), pos2.getZ())+1;
+        return new Box(minX+p, minY+p, minZ+p, maxX-p, maxY-p, maxZ-p);
     }
-    
+
     private boolean validateBlockType(Block block, StorageType type) {
         return switch (type) {
-            case CHEST -> block == Blocks.CHEST;
-            case TRAPPED_CHEST -> block == Blocks.TRAPPED_CHEST;
-            case BARREL -> block == Blocks.BARREL;
-            case FURNACE -> block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE || block == Blocks.SMOKER;
-            case DISPENSER -> block == Blocks.DISPENSER;
-            case DROPPER -> block == Blocks.DROPPER;
-            case HOPPER -> block == Blocks.HOPPER;
-            case BREWING_STAND -> block == Blocks.BREWING_STAND;
-            case CRAFTER -> block == Blocks.CRAFTER;
-            case DECORATED_POT -> block == Blocks.DECORATED_POT;
-            case CHEST_MINECART -> true;
+            case CHEST          -> block == Blocks.CHEST;
+            case TRAPPED_CHEST  -> block == Blocks.TRAPPED_CHEST;
+            case BARREL         -> block == Blocks.BARREL;
+            case SHULKER_BOX    -> block instanceof ShulkerBoxBlock;
+            case ENDER_CHEST    -> block == Blocks.ENDER_CHEST;
+            case UTILITY        -> block == Blocks.FURNACE || block == Blocks.BLAST_FURNACE
+                                || block == Blocks.SMOKER  || block == Blocks.HOPPER
+                                || block == Blocks.DISPENSER || block == Blocks.DROPPER;
+            case DECORATIVE     -> block == Blocks.BREWING_STAND || block == Blocks.CRAFTER
+                                || block == Blocks.DECORATED_POT || block == Blocks.CHISELED_BOOKSHELF;
         };
     }
 
     private SettingColor getColor(StorageType type) {
         return switch (type) {
-            case CHEST -> chestColor.get();
-            case TRAPPED_CHEST -> trappedChestColor.get();
-            case BARREL -> barrelColor.get();
-            case CHEST_MINECART -> chestMinecartColor.get();
-            case FURNACE -> furnaceColor.get();
-            case DISPENSER -> dispenserColor.get();
-            case DROPPER -> dropperColor.get();
-            case HOPPER -> hopperColor.get();
-            case BREWING_STAND -> brewingStandColor.get();
-            case CRAFTER -> crafterColor.get();
-            case DECORATED_POT -> decoratedPotColor.get();
+            case CHEST, TRAPPED_CHEST -> chestColor.get();
+            case BARREL         -> barrelColor.get();
+            case SHULKER_BOX    -> shulkerBoxColor.get();
+            case ENDER_CHEST    -> enderChestColor.get();
+            case UTILITY        -> utilityColor.get();
+            case DECORATIVE     -> decorativeColor.get();
         };
     }
 
-    public int getTotalContainers() {
-        return containers.size();
+    public int getTotalContainers() { return containers.size(); }
+
+    public boolean shouldShowStealDumpButtons() {
+        return isActive() && stealDumpButtons.get();
     }
 
-    private String getDimensionName(String dimensionId) {
-        return switch (dimensionId) {
-            case "minecraft:the_nether" -> "Nether";
-            case "minecraft:overworld" -> "Overworld";
-            case "minecraft:the_end" -> "End";
-            default -> dimensionId;
-        };
+    public int getDoubleChestCount() {
+        if (mc.world == null) return 0;
+        Set<BlockPos> counted = new HashSet<>();
+        int count = 0;
+        for (Map.Entry<BlockPos, StorageType> entry : containers.entrySet()) {
+            BlockPos    pos  = entry.getKey();
+            StorageType type = entry.getValue();
+            if (type != StorageType.CHEST && type != StorageType.TRAPPED_CHEST) continue;
+            if (counted.contains(pos)) continue;
+            BlockState state = mc.world.getBlockState(pos);
+            if (!(state.getBlock() instanceof ChestBlock)) continue;
+            try {
+                ChestType chestType = state.get(ChestBlock.CHEST_TYPE);
+                if (chestType == ChestType.SINGLE) continue;
+                BlockPos adjacent = findAdjacentChest(pos, false);
+                if (adjacent == null) continue;
+                counted.add(pos); counted.add(adjacent);
+                count++;
+            } catch (Exception ignored) {}
+        }
+        return count;
+    }
+
+    public int getShulkerBoxCount() {
+        int count = 0;
+        for (StorageType type : containers.values())
+            if (type == StorageType.SHULKER_BOX) count++;
+        return count;
+    }
+
+    public int getEnderChestCount() {
+        int count = 0;
+        for (StorageType type : containers.values())
+            if (type == StorageType.ENDER_CHEST) count++;
+        return count;
     }
 
     private enum StorageType {
-        CHEST,
-        TRAPPED_CHEST,
-        BARREL,
-        CHEST_MINECART,
-        FURNACE,
-        DISPENSER,
-        DROPPER,
-        HOPPER,
-        BREWING_STAND,
-        CRAFTER,
-        DECORATED_POT,
+        CHEST, TRAPPED_CHEST, BARREL, SHULKER_BOX, ENDER_CHEST,
+        UTILITY, DECORATIVE
     }
+
+    private record BeamData(Box box, SettingColor color) {}
 }
