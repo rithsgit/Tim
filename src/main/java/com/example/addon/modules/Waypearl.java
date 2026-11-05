@@ -1,5 +1,12 @@
 package com.example.addon.modules;
 
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -9,9 +16,12 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -19,7 +29,11 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import com.example.addon.Tim;
 import com.example.addon.utils.GlowingRegistry;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParseException;
 
+import net.fabricmc.loader.api.FabricLoader;
 import meteordevelopment.meteorclient.events.entity.EntityAddedEvent;
 import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
@@ -112,6 +126,10 @@ public class Waypearl extends Module {
 
     private static final Identifier BEAM_TEXTURE = Identifier.of("minecraft", "textures/entity/beacon_beam.png");
     private static final Map<Integer, Vec3d> BEAM_POS_CACHE = new ConcurrentHashMap<>();
+    private static final Gson PEARL_CACHE_GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Path PEARL_CACHE_PATH = FabricLoader.getInstance().getConfigDir()
+        .resolve("tim")
+        .resolve("waypearl-pearls.json");
 
     // ═══════════════════════════════════════════════════════════════
     // Setting Groups
@@ -466,14 +484,35 @@ public class Waypearl extends Module {
     // Pearl memory record
     // ═══════════════════════════════════════════════════════════════
 
-    private record PearlRecord(int entityId, String owner, BlockPos trapdoor, long discoveredMs) {}
+    private record PearlRecord(int entityId, UUID uuid, String server, String dimension, String owner,
+                               BlockPos pearlPos, BlockPos trapdoor, long discoveredMs) {}
+
+    private static final class PearlCache {
+        int version = 1;
+        List<PearlCacheEntry> pearls = new ArrayList<>();
+    }
+
+    private static final class PearlCacheEntry {
+        String server;
+        String dimension;
+        String uuid;
+        String owner;
+        int pearlX;
+        int pearlY;
+        int pearlZ;
+        boolean hasTrapdoor;
+        int trapdoorX;
+        int trapdoorY;
+        int trapdoorZ;
+        long discoveredMs;
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // State
     // ═══════════════════════════════════════════════════════════════
 
     private final AtomicReference<Map<String, Vec3d[]>> columnLines = new AtomicReference<>(Collections.emptyMap());
-    private final LinkedHashMap<Integer, PearlRecord> pearlMemory = new LinkedHashMap<>();
+    private final LinkedHashMap<String, PearlRecord> pearlMemory = new LinkedHashMap<>();
     private final Set<Integer> seenPearlIds = Collections.synchronizedSet(new HashSet<>());
 
     private final AtomicBoolean scanPending   = new AtomicBoolean(false);
@@ -504,7 +543,7 @@ public class Waypearl extends Module {
     // ═══════════════════════════════════════════════════════════════
 
     public Waypearl() {
-        super(Tim.CATEGORY, "Waypearl", "Detects nearby stasis pearls sitting above bubble columns[cite: 12].");
+        super(Tim.CATEGORY, "Waypearl", "Detects nearby stasis pearls sitting above bubble columns.");
     }
 
     public int getRange() { return range.get(); }
@@ -517,12 +556,11 @@ public class Waypearl extends Module {
     @Override
     public void onActivate() {
         columnLines.set(Collections.emptyMap());
-        synchronized (pearlMemory) { pearlMemory.clear(); }
+        loadPearlCache();
         seenPearlIds.clear();
         pingQueued.set(false);
         pullQueued.set(false);
         scanPending.set(false);
-        lastTriggerMs.set(0L);
         pendingNotifyTarget = null;
         tickCounter = 0;
         resetWalker();
@@ -539,8 +577,6 @@ public class Waypearl extends Module {
     @Override
     public void onDeactivate() {
         columnLines.set(Collections.emptyMap());
-        synchronized (pearlMemory) { pearlMemory.clear(); }
-        seenPearlIds.clear();
         pingQueued.set(false);
         pullQueued.set(false);
         scanPending.set(false);
@@ -731,8 +767,14 @@ public class Waypearl extends Module {
         if (selfPressed && !wasSelfTriggerPressed && moduleMode.get() == ModuleMode.Requester) {
             if (mc.currentScreen == null && (walkState == WalkState.IDLE || walkState == WalkState.ABORTED)) {
                 long now = System.currentTimeMillis();
-                if (now - lastTriggerMs.get() >= pullCooldown.get() * 1000L) {
+                long cooldownMs = pullCooldown.get() * 1000L;
+                long elapsedMs = now - lastTriggerMs.get();
+                if (elapsedMs >= cooldownMs) {
                     sendSelfTrigger();
+                } else {
+                    long remainingSeconds = (cooldownMs - elapsedMs + 999L) / 1000L;
+                    mc.player.sendMessage(Text.literal(
+                        "[Waypearl] Cooldown active — try again in " + remainingSeconds + "s."), false);
                 }
             }
         }
@@ -781,11 +823,15 @@ public class Waypearl extends Module {
         }
 
         mc.player.networkHandler.sendChatCommand("msg " + bot + " " + phrase + " " + sb.toString());
+        lastTriggerMs.set(System.currentTimeMillis());
         info("Sent pull request to §6" + bot + " §r(phrase: " + phrase + ").");
     }
 
     private void updatePearlMemory() {
         Map<String, Vec3d[]> lines = getColumnLines();
+        String server = currentServerKey();
+        String dimension = currentDimensionKey();
+        String botName = botUsername.get().trim();
         for (Entity e : mc.world.getEntities()) {
             if (e.getType() != EntityType.ENDER_PEARL) continue;
             if (mc.player.distanceTo(e) > range.get()) continue;
@@ -794,24 +840,37 @@ public class Waypearl extends Module {
             int    pz  = (int) Math.floor(e.getZ());
             String key = px + "," + pz;
             if (!lines.containsKey(key)) continue;
-            if (!seenPearlIds.add(e.getId())) continue;
 
             Vec3d[] line     = lines.get(key);
             int     topY     = (int) Math.floor(line[1].y);
             BlockPos trapdoor = findTrapdoor(px, topY, pz);
+            UUID pearlUuid = e.getUuid();
+            String memoryKey = pearlMemoryKey(server, dimension, pearlUuid);
+            PearlRecord previous;
+            synchronized (pearlMemory) {
+                previous = pearlMemory.get(memoryKey);
+            }
 
             String ownerName = "unknown";
             if (e instanceof EnderPearlEntity pearl) {
                 Entity owner = pearl.getOwner();
                 if (owner != null) ownerName = owner.getName().getString();
             }
+            if (ownerName.equals("unknown") && previous != null) ownerName = previous.owner();
+            if (!botName.isEmpty() && ownerName.equalsIgnoreCase(botName)) continue;
+            if (trapdoor == null && previous != null) trapdoor = previous.trapdoor();
 
-            synchronized (pearlMemory) {
-                pearlMemory.put(e.getId(), new PearlRecord(e.getId(), ownerName, trapdoor, System.currentTimeMillis()));
+            PearlRecord record = new PearlRecord(e.getId(), pearlUuid, server, dimension, ownerName,
+                BlockPos.ofFloored(e.getX(), e.getY(), e.getZ()), trapdoor,
+                previous == null ? System.currentTimeMillis() : previous.discoveredMs());
+            boolean newlyDiscovered = previous == null;
+            rememberPearl(record);
+            seenPearlIds.add(e.getId());
+
+            if (newlyDiscovered) {
+                pingQueued.set(true);
+                mc.player.sendMessage(Text.literal("[Waypearl] New stasis pearl — owner: " + ownerName), false);
             }
-
-            pingQueued.set(true);
-            mc.player.sendMessage(Text.literal("[Waypearl] New stasis pearl — owner: " + ownerName), false);
         }
     }
 
@@ -825,11 +884,14 @@ public class Waypearl extends Module {
         if (mc.world == null || mc.player == null) return;
 
         String botName = botUsername.get().trim();
+        String server = currentServerKey();
+        String dimension = currentDimensionKey();
         List<PearlRecord> candidates = new ArrayList<>();
         synchronized (pearlMemory) {
             for (PearlRecord rec : pearlMemory.values()) {
+                if (!rec.server().equals(server) || !rec.dimension().equals(dimension)) continue;
                 if (rec.trapdoor() == null) continue;
-                if (!pearlStillExists(rec.entityId())) continue;
+                if (!pearlStillExists(rec.uuid())) continue;
                 if (!isAnyTrapdoor(mc.world.getBlockState(rec.trapdoor()).getBlock())) continue;
                 if (!botName.isEmpty() && rec.owner().equalsIgnoreCase(botName)) continue;
                 candidates.add(rec);
@@ -866,9 +928,9 @@ public class Waypearl extends Module {
         dispatchTarget(candidates.get(0).trapdoor());
     }
 
-    private boolean pearlStillExists(int entityId) {
+    private boolean pearlStillExists(UUID pearlUuid) {
         for (Entity e : mc.world.getEntities()) {
-            if (e.getId() == entityId && e.getType() == EntityType.ENDER_PEARL) return true;
+            if (e.getUuid().equals(pearlUuid) && e.getType() == EntityType.ENDER_PEARL) return true;
         }
         return false;
     }
@@ -877,7 +939,8 @@ public class Waypearl extends Module {
         List<PearlRecord> found = new ArrayList<>();
         Map<String, Vec3d[]> lines = getColumnLines();
         String botName = botUsername.get().trim();
-
+        String server = currentServerKey();
+        String dimension = currentDimensionKey();
         for (Entity e : mc.world.getEntities()) {
             if (e.getType() != EntityType.ENDER_PEARL) continue;
             if (mc.player.distanceTo(e) > range.get()) continue;
@@ -887,7 +950,11 @@ public class Waypearl extends Module {
                 Entity owner = pearl.getOwner();
                 if (owner != null) ownerName = owner.getName().getString();
             }
-
+            PearlRecord previous;
+            synchronized (pearlMemory) {
+                previous = pearlMemory.get(pearlMemoryKey(server, dimension, e.getUuid()));
+            }
+            if (ownerName.equals("unknown") && previous != null) ownerName = previous.owner();
             if (!botName.isEmpty() && ownerName.equalsIgnoreCase(botName)) continue;
 
             int    px  = (int) Math.floor(e.getX());
@@ -900,9 +967,110 @@ public class Waypearl extends Module {
             BlockPos trapdoor = findTrapdoor(px, topY, pz);
             if (trapdoor == null) continue;
 
-            found.add(new PearlRecord(e.getId(), ownerName, trapdoor, 0L));
+            PearlRecord record = new PearlRecord(e.getId(), e.getUuid(), server, dimension, ownerName,
+                BlockPos.ofFloored(e.getX(), e.getY(), e.getZ()), trapdoor,
+                previous == null ? System.currentTimeMillis() : previous.discoveredMs());
+            rememberPearl(record);
+            found.add(record);
         }
         return found;
+    }
+
+    private String currentServerKey() {
+        if (mc.getCurrentServerEntry() == null) return "singleplayer";
+        return mc.getCurrentServerEntry().address.toLowerCase(Locale.ROOT);
+    }
+
+    private String currentDimensionKey() {
+        return mc.world.getRegistryKey().getValue().toString();
+    }
+
+    private String pearlMemoryKey(String server, String dimension, UUID pearlUuid) {
+        return server + "|" + dimension + "|" + pearlUuid;
+    }
+
+    private void rememberPearl(PearlRecord record) {
+        String key = pearlMemoryKey(record.server(), record.dimension(), record.uuid());
+        boolean changed;
+        synchronized (pearlMemory) {
+            PearlRecord previous = pearlMemory.put(key, record);
+            changed = previous == null
+                || !previous.owner().equals(record.owner())
+                || !previous.pearlPos().equals(record.pearlPos())
+                || !Objects.equals(previous.trapdoor(), record.trapdoor());
+        }
+        if (changed) savePearlCache();
+    }
+
+    private void loadPearlCache() {
+        if (!Files.exists(PEARL_CACHE_PATH)) return;
+        try (Reader reader = Files.newBufferedReader(PEARL_CACHE_PATH, StandardCharsets.UTF_8)) {
+            PearlCache cache = PEARL_CACHE_GSON.fromJson(reader, PearlCache.class);
+            if (cache == null || cache.pearls == null || cache.version != 1) {
+                throw new JsonParseException("Unsupported or invalid Waypearl cache format.");
+            }
+            synchronized (pearlMemory) {
+                for (PearlCacheEntry entry : cache.pearls) {
+                    if (entry == null || entry.server == null || entry.dimension == null || entry.uuid == null
+                        || entry.owner == null) {
+                        Tim.LOG.warn("Skipping incomplete Waypearl cache record in {}", PEARL_CACHE_PATH);
+                        continue;
+                    }
+                    try {
+                        UUID uuid = UUID.fromString(entry.uuid);
+                        BlockPos pearlPos = new BlockPos(entry.pearlX, entry.pearlY, entry.pearlZ);
+                        BlockPos trapdoor = entry.hasTrapdoor
+                            ? new BlockPos(entry.trapdoorX, entry.trapdoorY, entry.trapdoorZ)
+                            : null;
+                        PearlRecord record = new PearlRecord(-1, uuid, entry.server, entry.dimension,
+                            entry.owner, pearlPos, trapdoor, entry.discoveredMs);
+                        pearlMemory.put(pearlMemoryKey(entry.server, entry.dimension, uuid), record);
+                    } catch (IllegalArgumentException e) {
+                        Tim.LOG.warn("Skipping invalid Waypearl cache record in {}", PEARL_CACHE_PATH, e);
+                    }
+                }
+            }
+        } catch (IOException | JsonParseException e) {
+            Tim.LOG.warn("Unable to load Waypearl pearl cache from {}", PEARL_CACHE_PATH, e);
+        }
+    }
+
+    private void savePearlCache() {
+        PearlCache cache = new PearlCache();
+        synchronized (pearlMemory) {
+            for (PearlRecord record : pearlMemory.values()) {
+                PearlCacheEntry entry = new PearlCacheEntry();
+                entry.server = record.server();
+                entry.dimension = record.dimension();
+                entry.uuid = record.uuid().toString();
+                entry.owner = record.owner();
+                entry.pearlX = record.pearlPos().getX();
+                entry.pearlY = record.pearlPos().getY();
+                entry.pearlZ = record.pearlPos().getZ();
+                if (record.trapdoor() != null) {
+                    entry.hasTrapdoor = true;
+                    entry.trapdoorX = record.trapdoor().getX();
+                    entry.trapdoorY = record.trapdoor().getY();
+                    entry.trapdoorZ = record.trapdoor().getZ();
+                }
+                entry.discoveredMs = record.discoveredMs();
+                cache.pearls.add(entry);
+            }
+        }
+
+        Path temporaryPath = PEARL_CACHE_PATH.resolveSibling(PEARL_CACHE_PATH.getFileName() + ".tmp");
+        try {
+            Files.createDirectories(PEARL_CACHE_PATH.getParent());
+            Files.writeString(temporaryPath, PEARL_CACHE_GSON.toJson(cache), StandardCharsets.UTF_8);
+            try {
+                Files.move(temporaryPath, PEARL_CACHE_PATH,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temporaryPath, PEARL_CACHE_PATH, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            Tim.LOG.warn("Unable to save Waypearl pearl cache to {}", PEARL_CACHE_PATH, e);
+        }
     }
 
     private void dispatchTarget(BlockPos trapdoor) {

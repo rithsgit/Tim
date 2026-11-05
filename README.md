@@ -42,6 +42,10 @@
 - Tunnelers
 - Waypearl
 
+Waypearl persists discovered pearl owners and locations by server and dimension
+in `config/tim/waypearl-pearls.json`. Requester hotkey pulls use the configured
+cooldown to avoid repeatedly messaging the bot assistant.
+
 ## HUDs
 
 - Baromine
@@ -64,6 +68,34 @@
 - Server Report
 - Statistics Information
 - Time Throttle
+- Timmy Icon
+
+The Timmy Icon HUD displays Timmy from South Park, the namesake of the Tim
+addon, using `assets/tim/textures/hud/timmy.png`. Its `icon-scale` and `opacity`
+settings control the image's size and transparency. `padding-horizontal` and
+`padding-vertical` independently add space around the image, and the optional
+`background` setting adds a configurable color behind it.
+
+To enable the optional HUD sound, add your OGG audio file as
+`src/main/resources/assets/tim/sounds/timmy.ogg`. The Sound settings let you
+choose a randomized seconds/minutes/hours interval or a daily in-game time, and
+adjust volume. Settings are organized into Appearance, Blink, Sound, and Sound
+Schedule groups. Sleep schedule mode plays the sound when Timmy wakes after a
+configurable real-time or in-game-tick sleep duration.
+
+The Timmy Icon HUD can also blink using a closed-eyes image at
+`src/main/resources/assets/tim/textures/hud/timmy-blink.png`. Match its aspect
+ratio to the regular `timmy.png`; the Blink settings control the random interval
+and blink duration.
+
+When Timmy's sound plays, the HUD briefly displays the transparent
+`timmy-shout.png` image from the same folder.
+
+Angry expressions use transparent `timmy-angry-one.png` and
+`timmy-angry-two.png` images in the same folder. The Angry settings let you
+choose either expression or random selection, set random appearance intervals
+and display duration, and enable angry expressions when damage interrupts
+Sleep Mode.
 
 More modules and HUDs are planned.
 

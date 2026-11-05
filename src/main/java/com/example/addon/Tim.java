@@ -23,6 +23,7 @@ import com.example.addon.hud.SecondLifeHUD;
 import com.example.addon.hud.ServerReportHUD;
 import com.example.addon.hud.StatisticsInformation;
 import com.example.addon.hud.TimeThrottleHUD;
+import com.example.addon.hud.TimmyIconHud;
 import com.example.addon.modules.Baromine;
 import com.example.addon.modules.ChambersAssistant;
 import com.example.addon.modules.CityAssistant;
@@ -137,6 +138,7 @@ public class Tim extends MeteorAddon {
         Hud.get().register(ServerReportHUD.INFO);
         Hud.get().register(StatisticsInformation.INFO);
         Hud.get().register(TimeThrottleHUD.INFO);
+        Hud.get().register(TimmyIconHud.INFO);
     }
 
     @Override

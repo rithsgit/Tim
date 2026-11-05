@@ -70,6 +70,14 @@ public class NeighbourhoodWatchHUD extends HudElement {
         .build()
     );
 
+    private final Setting<Integer> nearbyPlayerRange = sgGeneral.add(new IntSetting.Builder()
+        .name("nearby-player-range")
+        .description("Maximum 3D distance for players shown in the nearby list.")
+        .defaultValue(128).min(1).sliderMax(256)
+        .visible(showNearby::get)
+        .build()
+    );
+
     private final Setting<Boolean> textShadow = sgGeneral.add(new BoolSetting.Builder()
         .name("text-shadow")
         .description("Enables a shadow/shader effect to make text pop more.")
@@ -213,7 +221,8 @@ public class NeighbourhoodWatchHUD extends HudElement {
         .name("show-fireworks").defaultValue(false).build()
     );
     private final Setting<Integer> fireworkRange = sgFireworks.add(new IntSetting.Builder()
-        .name("firework-range").defaultValue(64).min(1).sliderMax(256).visible(showFireworks::get).build()
+        .name("firework-range").description("Horizontal distance to track fireworks, regardless of altitude.")
+        .defaultValue(64).min(1).sliderMax(256).visible(showFireworks::get).build()
     );
     private final Setting<Boolean> showFireworkShotBy = sgFireworks.add(new BoolSetting.Builder()
         .name("show-shot-by").defaultValue(true).visible(showFireworks::get).build()
@@ -241,7 +250,8 @@ public class NeighbourhoodWatchHUD extends HudElement {
         .name("show-pearls").defaultValue(true).build()
     );
     private final Setting<Integer> pearlRange = sgPearls.add(new IntSetting.Builder()
-        .name("pearl-range").defaultValue(64).min(1).sliderMax(256).visible(showPearls::get).build()
+        .name("pearl-range").description("Horizontal distance to track pearls, regardless of altitude.")
+        .defaultValue(64).min(1).sliderMax(256).visible(showPearls::get).build()
     );
     private final Setting<Boolean> showPearlDistance = sgPearls.add(new BoolSetting.Builder()
         .name("show-pearl-distance").defaultValue(true).visible(showPearls::get).build()
@@ -260,7 +270,8 @@ public class NeighbourhoodWatchHUD extends HudElement {
         .name("show-items").defaultValue(true).build()
     );
     private final Setting<Integer> itemRange = sgItems.add(new IntSetting.Builder()
-        .name("item-range").defaultValue(64).min(1).sliderMax(256).visible(showItems::get).build()
+        .name("item-range").description("Horizontal distance to track dropped items, regardless of altitude.")
+        .defaultValue(64).min(1).sliderMax(256).visible(showItems::get).build()
     );
     private final Setting<Integer> maxItemRows = sgItems.add(new IntSetting.Builder()
         .name("max-item-rows").defaultValue(8).min(1).sliderMax(32).visible(showItems::get).build()
@@ -303,7 +314,8 @@ public class NeighbourhoodWatchHUD extends HudElement {
         .name("show-hostile-mobs").defaultValue(true).visible(() -> entityTrackingMode.get() == TrackingMode.Individual).build()
     );
     private final Setting<Integer> entityRange = sgEntities.add(new IntSetting.Builder()
-        .name("entity-range").defaultValue(64).min(1).sliderMax(256).build()
+        .name("entity-range").description("Horizontal distance to track entities, regardless of altitude.")
+        .defaultValue(64).min(1).sliderMax(256).build()
     );
     private final Setting<Integer> maxEntityRows = sgEntities.add(new IntSetting.Builder()
         .name("max-entity-rows").defaultValue(8).min(1).sliderMax(32).build()
@@ -348,10 +360,9 @@ public class NeighbourhoodWatchHUD extends HudElement {
 
     private Box playerBox(double range) {
         double px   = mc.player.getX();
-        double py   = mc.player.getY();
         double pz   = mc.player.getZ();
-        double minY = Math.max(py - range, mc.world.getDimension().minY());
-        double maxY = Math.min(py + range, mc.world.getDimension().minY() + mc.world.getDimension().height());
+        double minY = mc.world.getDimension().minY();
+        double maxY = minY + mc.world.getDimension().height();
         return new Box(px - range, minY, pz - range, px + range, maxY, pz + range);
     }
 
@@ -388,6 +399,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
             for (PlayerEntity player : mc.world.getPlayers()) {
                 if (player == mc.player || player.isSpectator()) continue;
                 float dist = mc.player.distanceTo(player);
+                if (dist > nearbyPlayerRange.get()) continue;
                 String name = player.getName().getString();
                 PlayerStatus status = moduleActive ? module.getPlayerStatusPublic(name) : PlayerStatus.Other;
                 ItemStack headStack = drawIcons ? LastSeenPlayerHud.getPlayerHead(player.getGameProfile()) : ItemStack.EMPTY;
@@ -434,7 +446,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
             Map<String, float[]> fwDistMap  = new LinkedHashMap<>();
             var rockets = mc.world.getEntitiesByClass(FireworkRocketEntity.class, fBox, e -> true);
             for (FireworkRocketEntity rocket : rockets) {
-                float dist = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(rocket));
+                float dist = horizontalDistance(rocket);
                 if (dist > fRange) continue;
                 String label = (showFireworkShotBy.get() && rocket.getOwner() instanceof PlayerEntity shooter) ? shooter.getName().getString() : "Firework Rocket";
                 fwCountMap.computeIfAbsent(label, k -> new int[]{0})[0]++;
@@ -457,7 +469,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
             double pRange = pearlRange.get();
             Box pBox = playerBox(pRange);
             for (Entity e : mc.world.getEntitiesByClass(Entity.class, pBox, en -> en.getType() == EntityType.ENDER_PEARL)) {
-                float dist = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(e));
+                float dist = horizontalDistance(e);
                 if (dist > pRange) continue;
                 pearlCount++;
                 if (dist < pearlNearest) pearlNearest = dist;
@@ -473,7 +485,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
             for (ItemEntity itemEntity : mc.world.getEntitiesByClass(ItemEntity.class, searchBox, e -> true)) {
                 ItemStack stack = itemEntity.getStack();
                 if (stack.isEmpty()) continue;
-                float dist = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(itemEntity));
+                float dist = horizontalDistance(itemEntity);
                 if (dist > range) continue;
                 String itemName = stack.getName().getString();
                 countMap.computeIfAbsent(itemName, k -> new int[]{0})[0] += stack.getCount();
@@ -513,7 +525,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
                 if (!crystals.isEmpty()) {
                     float nearest = Float.MAX_VALUE;
                     for (EndCrystalEntity e : crystals) {
-                        float d = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(e));
+                        float d = horizontalDistance(e);
                         if (d < nearest) nearest = d;
                     }
                     List<TrackedEntry> entries = List.of(new TrackedEntry("End Crystal", crystals.size(), nearest));
@@ -526,7 +538,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
                 if (!carts.isEmpty()) {
                     float nearest = Float.MAX_VALUE;
                     for (ChestMinecartEntity e : carts) {
-                        float d = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(e));
+                        float d = horizontalDistance(e);
                         if (d < nearest) nearest = d;
                     }
                     List<TrackedEntry> entries = List.of(new TrackedEntry("Chest Minecart", carts.size(), nearest));
@@ -544,7 +556,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
                     Map<String, float[]> vDistMap = new LinkedHashMap<>();
                     for (var e : vehicles) {
                         String typeName = e.getType().getName().getString();
-                        float dist = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(e));
+                        float dist = horizontalDistance(e);
                         vCountMap.computeIfAbsent(typeName, k -> new int[]{0})[0]++;
                         vDistMap.computeIfAbsent(typeName, k -> new float[]{Float.MAX_VALUE});
                         if (dist < vDistMap.get(typeName)[0]) vDistMap.get(typeName)[0] = dist;
@@ -1021,8 +1033,13 @@ public class NeighbourhoodWatchHUD extends HudElement {
     }
 
     private boolean isWithinRange(Entity entity, double range) {
-        return com.example.addon.utils.MinecraftCompat.position(mc.player)
-            .distanceTo(com.example.addon.utils.MinecraftCompat.position(entity)) <= range;
+        return horizontalDistance(entity) <= range;
+    }
+
+    private float horizontalDistance(Entity entity) {
+        double dx = mc.player.getX() - entity.getX();
+        double dz = mc.player.getZ() - entity.getZ();
+        return (float) Math.sqrt(dx * dx + dz * dz);
     }
 
     private SettingColor colorForStatus(PlayerStatus status) {
@@ -1050,7 +1067,7 @@ public class NeighbourhoodWatchHUD extends HudElement {
         int total = 0;
         for (MobEntity e : mobs) {
             String typeName = e.getType().getName().getString();
-            float dist = (float) com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(com.example.addon.utils.MinecraftCompat.position(e));
+            float dist = horizontalDistance(e);
             countMap.computeIfAbsent(typeName, k -> new int[]{0})[0]++;
             distMap.computeIfAbsent(typeName, k -> new float[]{Float.MAX_VALUE});
             if (dist < distMap.get(typeName)[0]) distMap.get(typeName)[0] = dist;

@@ -98,10 +98,12 @@ public class Timethrottle extends Module {
         .name("ping-adaptive-scaling").defaultValue(true).visible(this::isChunkVisible).build());
 
     private final Setting<Integer> chunkOverloadThreshold = sgChunkLoading.add(new IntSetting.Builder()
-        .name("overload-threshold").defaultValue(70).min(10).sliderMax(300).visible(this::isChunkVisible).build());
+        .name("overload-threshold").description("Missing-chunk count that starts timeout tracking when chunk loading stops making progress.")
+        .defaultValue(70).min(10).sliderMax(300).visible(this::isChunkVisible).build());
 
     private final Setting<Integer> chunkOverloadTimeout = sgChunkLoading.add(new IntSetting.Builder()
-        .name("overload-timeout-sec").defaultValue(10).min(2).sliderMax(60).visible(this::isChunkVisible).build());
+        .name("overload-timeout-sec").description("Triggers recovery only after this many seconds without new full chunks loading above the overload threshold.")
+        .defaultValue(10).min(2).sliderMax(60).visible(this::isChunkVisible).build());
 
     private final Setting<Integer> giveUpCooldown = sgChunkLoading.add(new IntSetting.Builder()
         .name("recovery-cooldown-sec").defaultValue(4).min(1).sliderMax(30).visible(this::isChunkVisible).build());
@@ -190,6 +192,9 @@ public class Timethrottle extends Module {
     private int giveUpRemainingTicks = 0;
     private int cachedUnloadedChunks = 0;
     private double smoothedUnloaded = -1.0;
+    private int lastLoadedChunks = -1;
+    private int lastPlayerChunkX = Integer.MIN_VALUE;
+    private int lastPlayerChunkZ = Integer.MIN_VALUE;
     private String activeDominantSource = "None";
 
     public Timethrottle() {
@@ -220,6 +225,7 @@ public class Timethrottle extends Module {
         giveUpRemainingTicks = 0;
         cachedUnloadedChunks = 0;
         smoothedUnloaded = -1.0;
+        resetChunkProgressTracking();
         lastSafetyReason = SafetyReason.NONE;
         activeDominantSource = "None";
         applySpeed(NORMAL_SPEED);
@@ -230,6 +236,7 @@ public class Timethrottle extends Module {
         if (mc.world == null || mc.player == null) return;
 
         if (!mc.world.getChunkManager().isChunkLoaded(mc.player.getChunkPos().x, mc.player.getChunkPos().z)) {
+            resetChunkProgressTracking();
             applySpeed(NORMAL_SPEED);
             return;
         }
@@ -254,8 +261,9 @@ public class Timethrottle extends Module {
             return;
         }
 
-        updateChunkCount();
-        manageOverloadTimeout();
+        ChunkCounts chunkCounts = countChunks();
+        updateChunkCount(chunkCounts.missing());
+        manageOverloadTimeout(chunkCounts.loaded());
 
         double speedChunk = isChunkVisible() ? evalChunkThrottle() : NORMAL_SPEED;
         double speedPing  = isPingVisible()  ? evalPingThrottle()  : NORMAL_SPEED;
@@ -300,28 +308,38 @@ public class Timethrottle extends Module {
         }
     }
 
-    private void updateChunkCount() {
-        int raw = countMissingChunks();
+    private void updateChunkCount(int raw) {
         if (smoothedUnloaded < 0) smoothedUnloaded = raw;
         else smoothedUnloaded = (smoothedUnloaded * 0.5) + (raw * 0.5);
         cachedUnloadedChunks = (int) Math.round(smoothedUnloaded);
     }
 
-    private void manageOverloadTimeout() {
+    private void manageOverloadTimeout(int loadedChunks) {
         if (!isChunkVisible()) {
-            overloadCounterTicks = 0;
+            resetChunkProgressTracking();
             return;
         }
 
+        int playerChunkX = mc.player.getChunkPos().x;
+        int playerChunkZ = mc.player.getChunkPos().z;
+        boolean playerMoved = playerChunkX != lastPlayerChunkX || playerChunkZ != lastPlayerChunkZ;
+        boolean chunksLoaded = lastLoadedChunks >= 0 && loadedChunks > lastLoadedChunks;
+
         if (cachedUnloadedChunks >= chunkOverloadThreshold.get()) {
-            overloadCounterTicks++;
+            if (playerMoved || lastLoadedChunks < 0 || chunksLoaded) overloadCounterTicks = 0;
+            else overloadCounterTicks++;
+
             if (overloadCounterTicks >= chunkOverloadTimeout.get() * TICKS_PER_SECOND) {
                 giveUpRemainingTicks = giveUpCooldown.get() * TICKS_PER_SECOND;
                 overloadCounterTicks = 0;
             }
         } else {
-            overloadCounterTicks = Math.max(0, overloadCounterTicks - 2);
+            overloadCounterTicks = 0;
         }
+
+        lastLoadedChunks = loadedChunks;
+        lastPlayerChunkX = playerChunkX;
+        lastPlayerChunkZ = playerChunkZ;
     }
 
     private double evalChunkThrottle() {
@@ -412,8 +430,7 @@ public class Timethrottle extends Module {
         if (timer != null) timer.setOverride(speed);
     }
 
-    private int countMissingChunks() {
-        if (mc.world == null || mc.player == null) return 0;
+    private ChunkCounts countChunks() {
         int vd = mc.options.getClampedViewDistance();
         int cx = mc.player.getChunkPos().x;
         int cz = mc.player.getChunkPos().z;
@@ -424,10 +441,13 @@ public class Timethrottle extends Module {
         double normZ = lookahead ? vel.z : 0;
 
         double weightedMissing = 0.0;
+        int loadedChunks = 0;
 
         for (int x = -vd; x <= vd; x++) {
             for (int z = -vd; z <= vd; z++) {
-                if (!mc.world.getChunkManager().isChunkLoaded(cx + x, cz + z)) {
+                if (mc.world.getChunkManager().isChunkLoaded(cx + x, cz + z)) {
+                    loadedChunks++;
+                } else {
                     if (lookahead) {
                         double dot = (x * normX) + (z * normZ);
                         weightedMissing += (dot > 0) ? 1.0 : 0.5;
@@ -437,8 +457,17 @@ public class Timethrottle extends Module {
                 }
             }
         }
-        return (int) Math.round(weightedMissing);
+        return new ChunkCounts((int) Math.round(weightedMissing), loadedChunks);
     }
+
+    private void resetChunkProgressTracking() {
+        overloadCounterTicks = 0;
+        lastLoadedChunks = -1;
+        lastPlayerChunkX = Integer.MIN_VALUE;
+        lastPlayerChunkZ = Integer.MIN_VALUE;
+    }
+
+    private record ChunkCounts(int missing, int loaded) {}
 
     public int getPlayerPing() {
         if (mc.getNetworkHandler() == null || mc.player == null) return 0;

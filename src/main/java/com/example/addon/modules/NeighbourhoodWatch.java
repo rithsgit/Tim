@@ -1,10 +1,13 @@
 package com.example.addon.modules;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 import com.example.addon.Tim;
 import com.example.addon.hud.LastSeenPlayerHud;
@@ -36,9 +39,12 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerListS2CPacket;
+import net.minecraft.network.packet.s2c.play.PlayerRemoveS2CPacket;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
+import net.minecraft.text.Style;
 import net.minecraft.util.Formatting;
 
 public class NeighbourhoodWatch extends Module {
@@ -268,6 +274,7 @@ public class NeighbourhoodWatch extends Module {
     private final Set<Integer> activelyOutlined   = new HashSet<>();
     private final Set<String>  ignoredThisSession = new HashSet<>();
     private final Set<String>  playersInTab       = new HashSet<>();
+    private final Map<UUID, String> playerNamesInTab = new HashMap<>();
     private final Set<String>  friendSet          = new HashSet<>();
     private final Set<String>  enemySet           = new HashSet<>();
     private final Set<String>  proxySet           = new HashSet<>();
@@ -278,6 +285,8 @@ public class NeighbourhoodWatch extends Module {
     private int actionBarTicks = 0;
     private Text actionBarMessage = null;
 
+    private record StyledTextSegment(String content, Style style) {}
+
     public NeighbourhoodWatch() {
         super(Tim.CATEGORY, "neighbourhood-watch",
             "Manages player tracking, safety, server monitoring, and keyword alerts.");
@@ -287,12 +296,7 @@ public class NeighbourhoodWatch extends Module {
     public void onActivate() {
         resetState();
         updateFriendEnemySets();
-        if (mc.player != null && mc.player.networkHandler != null) {
-            mc.player.networkHandler.getPlayerList().forEach(entry -> {
-                String name = MinecraftCompat.profileName(entry.getProfile());
-                if (name != null && !name.isEmpty()) playersInTab.add(name);
-            });
-        }
+        updatePlayersInTab();
     }
 
     @Override
@@ -307,6 +311,18 @@ public class NeighbourhoodWatch extends Module {
         clearAllOutlines();
         resetState();
         anyPlayerNearby = false;
+        updatePlayersInTab();
+    }
+
+    private void updatePlayersInTab() {
+        if (mc.player == null || mc.player.networkHandler == null) return;
+        mc.player.networkHandler.getPlayerList().forEach(entry -> {
+            String name = MinecraftCompat.profileName(entry.getProfile());
+            if (name != null && !name.isEmpty()) {
+                playersInTab.add(name);
+                playerNamesInTab.put(MinecraftCompat.profileId(entry.getProfile()), name);
+            }
+        });
     }
 
     @EventHandler
@@ -420,9 +436,7 @@ public class NeighbourhoodWatch extends Module {
 
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
-        if (mc.player == null || mc.world == null) return;
-
-        if (event.packet instanceof EntityStatusS2CPacket statusPacket) {
+        if (mc.world != null && event.packet instanceof EntityStatusS2CPacket statusPacket) {
             if (statusPacket.getStatus() == 35) {
                 Entity entity = statusPacket.getEntity(mc.world);
                 if (entity instanceof PlayerEntity player && !isLocalPlayer(player)) {
@@ -431,20 +445,26 @@ public class NeighbourhoodWatch extends Module {
             }
         }
 
+        if (event.packet instanceof PlayerRemoveS2CPacket packet) {
+            for (UUID profileId : packet.profileIds()) {
+                String name = playerNamesInTab.remove(profileId);
+                if (name != null && playersInTab.remove(name)) handleTabListChange(name, "left");
+            }
+            return;
+        }
+
         if (!(event.packet instanceof PlayerListS2CPacket packet)) return;
 
         for (PlayerListS2CPacket.Entry entry : packet.getEntries()) {
             if (entry.profile() == null) continue;
             String name = MinecraftCompat.profileName(entry.profile());
             if (name == null || name.isEmpty()) continue;
+            UUID profileId = MinecraftCompat.profileId(entry.profile());
 
             if (packet.getActions().contains(PlayerListS2CPacket.Action.ADD_PLAYER)) {
+                playerNamesInTab.put(profileId, name);
                 if (playersInTab.add(name)) {
                     handleTabListChange(name, "joined");
-                }
-            } else if (packet.getActions().contains(PlayerListS2CPacket.Action.UPDATE_LISTED) && !entry.listed()) {
-                if (playersInTab.remove(name)) {
-                    handleTabListChange(name, "left");
                 }
             }
         }
@@ -458,9 +478,32 @@ public class NeighbourhoodWatch extends Module {
         if (filterMode.get() == FilterMode.AutoIgnore) {
             parseMessageForAutoIgnore(event.getMessage().getString());
         } else {
-            String censored = censorMessage(event.getMessage().getString());
-            if (censored != null) event.setMessage(Text.literal(censored));
+            Text original = event.getMessage();
+            Text censored = censorText(original);
+            if (!censored.getString().equals(original.getString())) event.setMessage(censored);
         }
+    }
+
+    private Text censorText(Text text) {
+        List<StyledTextSegment> segments = new ArrayList<>();
+        StringBuilder plainText = new StringBuilder();
+        text.visit((style, content) -> {
+            segments.add(new StyledTextSegment(content, style));
+            plainText.append(content);
+            return Optional.empty();
+        }, Style.EMPTY);
+
+        String censored = censorMessage(plainText.toString());
+        if (censored == null) return text;
+
+        MutableText result = Text.empty();
+        int offset = 0;
+        for (StyledTextSegment segment : segments) {
+            int end = offset + segment.content().length();
+            result.append(Text.literal(censored.substring(offset, end)).setStyle(segment.style()));
+            offset = end;
+        }
+        return result;
     }
 
     private boolean tickDisconnectOnPlayer() {
@@ -487,6 +530,7 @@ public class NeighbourhoodWatch extends Module {
 
         anyPlayerNearby = false;
         Set<Integer> playersInVisualRangeThisTick = new HashSet<>();
+        Set<Integer> eligiblePlayersThisTick = new HashSet<>();
 
         for (PlayerEntity player : mc.world.getPlayers()) {
             if (isLocalPlayer(player) || player.isSpectator()) continue;
@@ -520,6 +564,7 @@ public class NeighbourhoodWatch extends Module {
             };
             if (!shouldNotify) continue;
 
+            eligiblePlayersThisTick.add(player.getId());
             if (isNewlySpotted) {
                 String statusStr = status.name().toLowerCase();
                 String msg = customMessage.get()
@@ -569,7 +614,7 @@ public class NeighbourhoodWatch extends Module {
         }
 
         notifiedPlayers.clear();
-        notifiedPlayers.addAll(playersInVisualRangeThisTick);
+        notifiedPlayers.addAll(eligiblePlayersThisTick);
     }
 
     private void handleTotemPop(PlayerEntity player) {
@@ -677,6 +722,7 @@ public class NeighbourhoodWatch extends Module {
         notifiedPlayers.clear();
         ignoredThisSession.clear();
         playersInTab.clear();
+        playerNamesInTab.clear();
         actionBarTicks = 0;
         actionBarMessage = null;
         totemPops.clear();

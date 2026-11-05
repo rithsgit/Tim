@@ -7,14 +7,13 @@ import net.minecraft.client.gui.tooltip.Tooltip;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.input.AbstractInput;
 import net.minecraft.client.input.KeyInput;
+import net.minecraft.client.render.block.entity.BeaconBlockEntityRenderer;
 import net.minecraft.item.ItemStack;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.client.util.math.MatrixStack;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
-import meteordevelopment.meteorclient.renderer.ShapeMode;
-import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 
 import java.util.function.BooleanSupplier;
 
@@ -76,15 +75,17 @@ public final class MinecraftApiCompat {
                                        Vec3d cameraPos, Identifier texture, float tickDelta,
                                        long worldTime, int height, int packedColor,
                                        float innerRadius, float outerRadius) {
-        int red = packedColor >> 16 & 0xFF;
-        int green = packedColor >> 8 & 0xFF;
-        int blue = packedColor & 0xFF;
-        int alpha = packedColor >>> 24 & 0xFF;
-        SettingColor beamColor = new SettingColor(red, green, blue, alpha);
-        event.renderer.box(
-            new Box(base.x - innerRadius, base.y, base.z - innerRadius,
-                    base.x + innerRadius, base.y + height, base.z + innerRadius),
-            beamColor, beamColor, ShapeMode.Both, 0
-        );
+        MatrixStack matrices = event.matrices;
+        matrices.push();
+        try {
+            matrices.translate(base.x - cameraPos.x - 0.5, base.y - cameraPos.y, base.z - cameraPos.z - 0.5);
+            var commandQueue = client.gameRenderer.getEntityRenderCommandQueue();
+            BeaconBlockEntityRenderer.renderBeam(
+                matrices, commandQueue, texture, tickDelta, 1.0f, 0, height,
+                packedColor, innerRadius, outerRadius
+            );
+        } finally {
+            matrices.pop();
+        }
     }
 }
