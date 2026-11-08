@@ -1,0 +1,1197 @@
+package com.example.addon.modules;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Random;
+import java.util.Set;
+
+import com.example.addon.Tim;
+
+import baritone.api.BaritoneAPI;
+import baritone.api.process.IBaritoneProcess;
+import baritone.api.process.PathingCommand;
+import baritone.api.process.PathingCommandType;
+import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
+import meteordevelopment.meteorclient.events.packets.PacketEvent;
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnchantmentListSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.KeybindSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.meteorclient.utils.player.Rotations;
+import meteordevelopment.orbit.EventHandler;
+import net.minecraft.client.gui.screens.ChatScreen;
+import net.minecraft.client.gui.screens.DeathScreen;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundEntityEventPacket;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.food.FoodProperties;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemAttributeModifiers;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.state.BlockState;
+
+public class ServerHealthcareSystem extends Module {
+
+    private final SettingGroup sgGeneral   = settings.getDefaultGroup();
+    private final SettingGroup sgAutoArmor = settings.createGroup("Auto Armor");
+    private final SettingGroup sgAutoEat   = settings.createGroup("Auto Eat");
+    private final SettingGroup sgSafety    = settings.createGroup("Safety");
+
+    private final Setting<OperationMode> mode = sgGeneral.add(new EnumSetting.Builder<OperationMode>()
+        .name("mode")
+        .description("Changes the behavior of the module between Default and Quick Respawn modes.")
+        .defaultValue(OperationMode.Default)
+        .build()
+    );
+
+    private final Setting<Boolean> autoRespawn = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-respawn")
+        .description("Automatically respawns after death.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> autoTotem = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-totem")
+        .description("Automatically equips a totem of undying in your offhand.")
+        .defaultValue(true)
+        .visible(() -> mode.get() == OperationMode.Default)
+        .build()
+    );
+
+    private final Setting<Boolean> autoArmor = sgAutoArmor.add(new BoolSetting.Builder()
+        .name("auto-armor")
+        .description("Automatically equips the best armor in your inventory.")
+        .defaultValue(true)
+        .visible(() -> mode.get() == OperationMode.Default)
+        .build()
+    );
+
+    private final Setting<IgnoredArmorSlot> ignoredArmorSlot = sgAutoArmor.add(new EnumSetting.Builder<IgnoredArmorSlot>()
+        .name("ignored-armor-slot")
+        .description("Ignores the selected armor slot when Auto Armor is enabled.")
+        .defaultValue(IgnoredArmorSlot.None)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get())
+        .build()
+    );
+
+    private final Setting<ChestplateMode> chestplateMode = sgAutoArmor.add(new EnumSetting.Builder<ChestplateMode>()
+        .name("chestplate-mode")
+        .description("How to manage the chest slot. Smart auto-swaps based on movement.")
+        .defaultValue(ChestplateMode.Chestplate)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get())
+        .build()
+    );
+
+    private final Setting<Keybind> switchModeKey = sgAutoArmor.add(new KeybindSetting.Builder()
+        .name("switch-preference-key")
+        .description("Cycles chestplate mode: Chestplate -> Elytra -> Smart.")
+        .defaultValue(Keybind.none())
+        .action(() -> {
+            if (mc.screen != null) return;
+            ChestplateMode current = chestplateMode.get();
+            ChestplateMode next = switch (current) {
+                case Chestplate -> ChestplateMode.Elytra;
+                case Elytra -> ChestplateMode.Smart;
+                case Smart -> ChestplateMode.Chestplate;
+            };
+            chestplateMode.set(next);
+            info("Chestplate mode set to: %s", next.name());
+        })
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get())
+        .build()
+    );
+
+    private final Setting<Keybind> smartToggleKey = sgAutoArmor.add(new KeybindSetting.Builder()
+        .name("smart-toggle-key")
+        .description("Quickly toggle smart chestplate on/off.")
+        .defaultValue(Keybind.none())
+        .action(() -> {
+            if (mc.screen != null) return;
+            if (chestplateMode.get() == ChestplateMode.Smart) {
+                chestplateMode.set(ChestplateMode.Chestplate);
+                info("Smart Chestplate: OFF");
+            } else {
+                chestplateMode.set(ChestplateMode.Smart);
+                info("Smart Chestplate: ON");
+            }
+        })
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get())
+        .build()
+    );
+
+    private final Setting<Keybind> manualSwapKey = sgAutoArmor.add(new KeybindSetting.Builder()
+        .name("manual-swap-key")
+        .description("Manually swap between chestplate and elytra.")
+        .defaultValue(Keybind.none())
+        .action(() -> {
+            if (mc.screen != null || mc.player == null) return;
+            manualSwapRequested = true;
+        })
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get() && chestplateMode.get() == ChestplateMode.Smart)
+        .build()
+    );
+
+    private final Setting<Integer> swapCooldownMs = sgAutoArmor.add(new IntSetting.Builder()
+        .name("swap-cooldown-ms")
+        .description("Milliseconds to wait between swaps to prevent spam.")
+        .defaultValue(400)
+        .min(0)
+        .max(3000)
+        .sliderRange(0, 1500)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get() && chestplateMode.get() == ChestplateMode.Smart)
+        .build()
+    );
+
+    private final Setting<Integer> jumpDelayMs = sgAutoArmor.add(new IntSetting.Builder()
+        .name("jump-delay-ms")
+        .description("Milliseconds after jumping before swapping to elytra. If you land before this expires, the swap is cancelled.")
+        .defaultValue(200)
+        .min(0)
+        .max(2000)
+        .sliderRange(0, 1000)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get() && chestplateMode.get() == ChestplateMode.Smart)
+        .build()
+    );
+
+    private final Setting<Double> fallDistanceTrigger = sgAutoArmor.add(new DoubleSetting.Builder()
+        .name("fall-distance-trigger")
+        .description("Fall distance that forces an elytra swap (even without jumping).")
+        .defaultValue(3.5)
+        .min(0)
+        .max(20)
+        .sliderRange(0, 10)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get() && chestplateMode.get() == ChestplateMode.Smart)
+        .build()
+    );
+
+    private final Setting<Boolean> swapBackOnLand = sgAutoArmor.add(new BoolSetting.Builder()
+        .name("swap-back-on-land")
+        .description("Swap back to chestplate when you touch the ground.")
+        .defaultValue(true)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get() && chestplateMode.get() == ChestplateMode.Smart)
+        .build()
+    );
+
+    private final Setting<Set<ResourceKey<Enchantment>>> ignoredEnchantments = sgAutoArmor.add(new EnchantmentListSetting.Builder()
+        .name("ignored-enchantments")
+        .description("Armor with these enchantments will be ignored by Auto Armor.")
+        .defaultValue(Enchantments.BINDING_CURSE)
+        .visible(() -> mode.get() == OperationMode.Default && autoArmor.get())
+        .build()
+    );
+
+    private final Setting<Boolean> autoEat = sgAutoEat.add(new BoolSetting.Builder()
+        .name("auto-eat")
+        .description("Automatically eats food when conditions are met.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> preferEnchanted = sgAutoEat.add(new BoolSetting.Builder()
+        .name("prefer-enchanted")
+        .description("Prefer enchanted golden apples over regular ones when emergency eating.")
+        .defaultValue(false)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Integer> healthThreshold = sgAutoEat.add(new IntSetting.Builder()
+        .name("health-threshold")
+        .description("Health at which auto-eat triggers (out of 20). Set to 0 to disable health-based eating.")
+        .defaultValue(10)
+        .min(0)
+        .max(19)
+        .sliderRange(0, 19)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Integer> hungerLoss = sgAutoEat.add(new IntSetting.Builder()
+        .name("hunger-loss")
+        .description("How many TOTAL hunger points must be lost to trigger eating.")
+        .defaultValue(2)
+        .min(1)
+        .max(20)
+        .sliderRange(1, 10)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> eatOnFire = sgAutoEat.add(new BoolSetting.Builder()
+        .name("eat-on-fire")
+        .description("Eat gapples when on fire and taking damage to gain fire resistance.")
+        .defaultValue(true)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Integer> eatCooldown = sgAutoEat.add(new IntSetting.Builder()
+        .name("eat-cooldown")
+        .description("Ticks to wait after eating before eating again.")
+        .defaultValue(20)
+        .min(0)
+        .max(100)
+        .sliderRange(0, 60)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> swapBack = sgAutoEat.add(new BoolSetting.Builder()
+        .name("swap-back")
+        .description("Swap back to original slot after eating.")
+        .defaultValue(true)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> pauseInCombat = sgAutoEat.add(new BoolSetting.Builder()
+        .name("pause-in-combat")
+        .description("Don't eat normal food while taking damage (gapples still work).")
+        .defaultValue(false)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> skipIfRegen = sgAutoEat.add(new BoolSetting.Builder()
+        .name("skip-if-regen")
+        .description("Doesn't eat golden apples for hunger if you already have regeneration.")
+        .defaultValue(false)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    public final Setting<Boolean> pauseBaritone = sgAutoEat.add(new BoolSetting.Builder()
+        .name("pause-baritone")
+        .description("Pauses Baritone while auto-eating to prevent it from interrupting or skipping meals.")
+        .defaultValue(true)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Boolean> disconnectOnTotemPop = sgSafety.add(new BoolSetting.Builder()
+        .name("disconnect-on-totem-pop")
+        .description("Disconnects when a totem of undying is consumed.")
+        .defaultValue(false)
+        .visible(() -> mode.get() == OperationMode.Default)
+        .build()
+    );
+
+    private final Setting<Boolean> disconnectOnNoTotems = sgSafety.add(new BoolSetting.Builder()
+        .name("disconnect-on-no-totems")
+        .description("Disconnects if totem count reaches zero.")
+        .defaultValue(false)
+        .visible(() -> mode.get() == OperationMode.Default)
+        .build()
+    );
+
+    private final Setting<Keybind> breakBedHotkey = sgSafety.add(new KeybindSetting.Builder()
+        .name("break-bed-hotkey")
+        .description("Hotkey to automatically break the nearest bed when in Quick Respawn mode.")
+        .defaultValue(Keybind.none())
+        .action(() -> {
+            if (mc.screen != null || mc.player == null) return;
+            if (mode.get() == OperationMode.QuickRespawn) {
+                BlockPos nearest = findNearestBed();
+                if (nearest != null) {
+                    bedToBreak = nearest;
+                    breakTickCounter = 0;
+                    bedOriginalHotbarSlot = getSelectedSlot();
+                    info("Initiating bed breaking at %s...", nearest.toShortString());
+                } else {
+                    warning("No bed found nearby to break.");
+                }
+            }
+        })
+        .visible(() -> mode.get() == OperationMode.QuickRespawn)
+        .build()
+    );
+
+    private boolean isEating              = false;
+    private boolean ateForFire            = false;
+    private boolean tookDamageWhileOnFire = false;
+    private int     eatHotbarSlot         = -1;
+    private int     eatOriginalHotbarSlot = -1;
+    private Item    eatTargetItem         = null;
+    private int     eatStartupTicks       = 0;
+    private int     eatTicksRemaining     = 0;
+    private float   lastHealth            = -1;
+    private int     highestHungerSeen     = -1;
+    private int     eatCooldownTimer      = 0;
+    private boolean tookDamageRecently    = false;
+    private int     damageTimer           = 0;
+    private int     moveWaitTicks         = 0;
+
+    private BlockPos bedToBreak            = null;
+    private int      breakTickCounter      = 0;
+    private int      bedOriginalHotbarSlot = -1;
+
+    private long    lastSwapTime        = 0;
+    private long    jumpTime            = -1;
+    private boolean wasOnGround         = true;
+    private double  lastPlayerY         = Double.NaN;
+    private boolean manualSwapRequested = false;
+
+    private int antiAfkTickCounter    = 0;
+    private int antiAfkNextSwingTicks = 0;
+    private int lastSwingDelayTicks   = -1;
+    private static final Random AFK_RANDOM = new Random();
+
+    private static Method GET_SELECTED_SLOT_METHOD = null;
+    private static Field  SELECTED_SLOT_FIELD      = null;
+    private static boolean SLOT_REFLECTION_INIT    = false;
+
+    public ServerHealthcareSystem() {
+        super(Tim.CATEGORY, "server-healthcare-system",
+            "SHS — Manages health, safety, tracking, and server monitoring.");
+
+        try {
+            BaritoneAPI.getProvider().getPrimaryBaritone().getPathingControlManager().registerProcess(EatProcess.INSTANCE);
+        } catch (NoClassDefFoundError | Exception ignored) {}
+    }
+
+    @Override
+    public void onActivate() {
+        if (mc.player != null) {
+            lastHealth = mc.player.getHealth();
+            highestHungerSeen = mc.player.getFoodData().getFoodLevel();
+            lastPlayerY = mc.player.getY();
+        }
+        resetState();
+
+        antiAfkTickCounter    = 0;
+        lastSwingDelayTicks   = -1;
+        antiAfkNextSwingTicks = generateAntiAfkDelay();
+    }
+
+    @Override
+    public void onDeactivate() {
+        stopEating();
+        lastHealth = -1;
+        highestHungerSeen = -1;
+        if (bedOriginalHotbarSlot != -1) {
+            InvUtils.swap(bedOriginalHotbarSlot, false);
+        }
+        resetState();
+    }
+
+    @EventHandler
+    private void onGameJoined(GameJoinedEvent event) {
+        if (mc.player != null) {
+            lastHealth = mc.player.getHealth();
+            highestHungerSeen = mc.player.getFoodData().getFoodLevel();
+            lastPlayerY = mc.player.getY();
+        }
+        resetState();
+        if (autoTotem.get()) tickAutoTotem();
+    }
+
+    public boolean isAutoTotemEnabled() { return isActive() && autoTotem.get(); }
+    public void setAutoTotem(boolean enabled) { autoTotem.set(enabled); }
+    public boolean isEating() { return isEating || moveWaitTicks > 0; }
+
+    private int getSelectedSlot() {
+        if (mc.player == null) return 0;
+        Inventory inv = mc.player.getInventory();
+
+        if (!SLOT_REFLECTION_INIT) {
+            SLOT_REFLECTION_INIT = true;
+            try {
+                GET_SELECTED_SLOT_METHOD = Inventory.class.getMethod("getSelectedSlot");
+            } catch (NoSuchMethodException e1) {
+                try {
+                    GET_SELECTED_SLOT_METHOD = Inventory.class.getMethod("method_67532");
+                } catch (NoSuchMethodException ignored) {}
+            }
+
+            if (GET_SELECTED_SLOT_METHOD == null) {
+                for (String fieldName : new String[]{"selectedSlot", "field_7545"}) {
+                    try {
+                        Field f = Inventory.class.getDeclaredField(fieldName);
+                        f.setAccessible(true);
+                        SELECTED_SLOT_FIELD = f;
+                        break;
+                    } catch (NoSuchFieldException ignored) {}
+                }
+            }
+        }
+
+        try {
+            if (GET_SELECTED_SLOT_METHOD != null) {
+                return (int) GET_SELECTED_SLOT_METHOD.invoke(inv);
+            } else if (SELECTED_SLOT_FIELD != null) {
+                return SELECTED_SLOT_FIELD.getInt(inv);
+            }
+        } catch (Exception ignored) {}
+
+        return 0;
+    }
+
+    private void selectHotbarSlot(int slot) {
+        if (mc.player == null || slot < 0 || slot > 8) return;
+        if (getSelectedSlot() != slot) {
+            InvUtils.swap(slot, false);
+        }
+    }
+
+    private void resetState() {
+        isEating              = false;
+        ateForFire            = false;
+        tookDamageWhileOnFire = false;
+        eatHotbarSlot         = -1;
+        eatOriginalHotbarSlot = -1;
+        eatTargetItem         = null;
+        eatStartupTicks       = 0;
+        eatTicksRemaining     = 0;
+        eatCooldownTimer      = 0;
+        tookDamageRecently    = false;
+        damageTimer           = 0;
+        bedOriginalHotbarSlot = -1;
+        highestHungerSeen     = -1;
+        moveWaitTicks         = 0;
+
+        lastSwapTime        = 0;
+        jumpTime            = -1;
+        wasOnGround         = true;
+        lastPlayerY         = mc.player != null ? mc.player.getY() : Double.NaN;
+        manualSwapRequested = false;
+
+        antiAfkTickCounter    = 0;
+        antiAfkNextSwingTicks = 0;
+        lastSwingDelayTicks   = -1;
+    }
+
+    private void stopEating() {
+        mc.options.keyUse.setDown(false);
+        if (mc.gameMode != null && mc.player != null && mc.player.isUsingItem()) {
+            mc.gameMode.releaseUsingItem(mc.player);
+        }
+        isEating              = false;
+        eatHotbarSlot         = -1;
+        eatOriginalHotbarSlot = -1;
+        eatTargetItem         = null;
+        eatStartupTicks       = 0;
+        eatTicksRemaining     = 0;
+        moveWaitTicks         = 0;
+    }
+
+    private void finishEating() {
+        mc.options.keyUse.setDown(false);
+        if (mc.gameMode != null && mc.player != null && mc.player.isUsingItem()) {
+            mc.gameMode.releaseUsingItem(mc.player);
+        }
+
+        if (swapBack.get() && eatOriginalHotbarSlot != -1 && eatOriginalHotbarSlot != eatHotbarSlot) {
+            InvUtils.swap(eatOriginalHotbarSlot, false);
+        }
+
+        isEating              = false;
+        eatHotbarSlot         = -1;
+        eatOriginalHotbarSlot = -1;
+        eatTargetItem         = null;
+        eatStartupTicks       = 0;
+        eatTicksRemaining     = 0;
+        eatCooldownTimer      = eatCooldown.get();
+        highestHungerSeen     = -1;
+    }
+
+    private void startEatingItem() {
+        if (mc.player == null || mc.gameMode == null) return;
+        mc.options.keyUse.setDown(true);
+        mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
+    }
+
+    private boolean isDisallowedScreenOpen() {
+        return mc.screen != null && !(mc.screen instanceof ChatScreen);
+    }
+
+    @EventHandler
+    private void onTick(TickEvent.Pre event) {
+        if (mc.player == null || mc.level == null) return;
+
+        tickAntiAfk();
+
+        switch (mode.get()) {
+            case Default -> {
+                tickAutoTotem();
+                tickAutoArmor();
+                tickSmartChestplate();
+                tickAutoEat();
+                tickHealthTracking();
+                tickAutoRespawn();
+            }
+            case QuickRespawn -> {
+                tickAutoRespawn();
+                tickQuickRespawnMode();
+                tickAutoEat();
+                tickHealthTracking();
+            }
+        }
+    }
+
+    private void tickAntiAfk() {
+        if (mc.player == null || mc.player.connection == null) return;
+
+        antiAfkTickCounter++;
+
+        if (antiAfkTickCounter >= antiAfkNextSwingTicks) {
+            mc.player.swing(InteractionHand.MAIN_HAND);
+            antiAfkTickCounter    = 0;
+            antiAfkNextSwingTicks = generateAntiAfkDelay();
+        }
+    }
+
+    private int generateAntiAfkDelay() {
+        int delay;
+        do {
+            delay = 200 + AFK_RANDOM.nextInt(501);
+        } while (delay == lastSwingDelayTicks);
+        lastSwingDelayTicks = delay;
+        return delay;
+    }
+
+    private void tickHealthTracking() {
+        if (mc.player == null) return;
+
+        if (lastHealth == -1) lastHealth = mc.player.getHealth();
+
+        float health = mc.player.getHealth();
+
+        if (health < lastHealth) {
+            tookDamageRecently = true;
+            damageTimer = 40;
+        }
+
+        if (mc.player.isOnFire()) {
+            if (health < lastHealth) tookDamageWhileOnFire = true;
+        } else {
+            ateForFire            = false;
+            tookDamageWhileOnFire = false;
+        }
+
+        lastHealth = health;
+
+        if (tookDamageRecently) {
+            damageTimer--;
+            if (damageTimer <= 0) {
+                tookDamageRecently = false;
+                damageTimer = 0;
+            }
+        }
+    }
+
+    private void tickAutoRespawn() {
+        if (autoRespawn.get() && mc.screen instanceof DeathScreen) {
+            mc.player.respawn();
+            mc.setScreen(null);
+        }
+    }
+
+    private void tickQuickRespawnMode() {
+        if (bedToBreak != null) {
+            if (!(mc.level.getBlockState(bedToBreak).getBlock() instanceof BedBlock)) {
+                info("Bed at %s broken.", bedToBreak.toShortString());
+                bedToBreak = null;
+                if (bedOriginalHotbarSlot != -1) {
+                    InvUtils.swap(bedOriginalHotbarSlot, false);
+                    bedOriginalHotbarSlot = -1;
+                }
+                return;
+            }
+
+            if (mc.player.blockPosition().distSqr(bedToBreak) > 36.0) {
+                warning("Too far from bed, stopping breaking.");
+                bedToBreak = null;
+                if (bedOriginalHotbarSlot != -1) {
+                    InvUtils.swap(bedOriginalHotbarSlot, false);
+                    bedOriginalHotbarSlot = -1;
+                }
+                return;
+            }
+
+            int bestToolSlot = findBestTool(bedToBreak);
+
+            if (bestToolSlot != -1 && getSelectedSlot() != bestToolSlot) {
+                if (bedOriginalHotbarSlot == -1) {
+                    bedOriginalHotbarSlot = getSelectedSlot();
+                }
+                InvUtils.swap(bestToolSlot, false);
+            }
+
+            Rotations.rotate(Rotations.getYaw(bedToBreak), Rotations.getPitch(bedToBreak), () -> {
+                mc.gameMode.continueDestroyBlock(bedToBreak, Direction.UP);
+                mc.player.swing(InteractionHand.MAIN_HAND);
+            });
+
+            breakTickCounter++;
+        }
+    }
+
+    private void tickAutoTotem() {
+        if (!autoTotem.get()) return;
+
+        if (!mc.player.getOffhandItem().is(Items.TOTEM_OF_UNDYING)) {
+            FindItemResult totem = InvUtils.find(Items.TOTEM_OF_UNDYING);
+            if (totem.found()) {
+                InvUtils.move().from(totem.slot()).toOffhand();
+            } else if (disconnectOnNoTotems.get()) {
+                disconnect("[SHS] Disconnected — no totems remaining.");
+            }
+        }
+    }
+
+    private void tickAutoArmor() {
+        if (!autoArmor.get()) return;
+
+        EquipmentSlot[] slots = { EquipmentSlot.FEET, EquipmentSlot.LEGS, EquipmentSlot.CHEST, EquipmentSlot.HEAD };
+        for (int i = 0; i < 4; i++) {
+            EquipmentSlot slot = slots[i];
+
+            if (ignoredArmorSlot.get() == IgnoredArmorSlot.All) continue;
+            if (slot == EquipmentSlot.HEAD && ignoredArmorSlot.get() == IgnoredArmorSlot.Helmet) continue;
+            if (slot == EquipmentSlot.CHEST && (ignoredArmorSlot.get() == IgnoredArmorSlot.Chestplate || chestplateMode.get() == ChestplateMode.Smart)) continue;
+            if (slot == EquipmentSlot.LEGS && ignoredArmorSlot.get() == IgnoredArmorSlot.Leggings) continue;
+            if (slot == EquipmentSlot.FEET && ignoredArmorSlot.get() == IgnoredArmorSlot.Boots) continue;
+
+            ItemStack current   = mc.player.getItemBySlot(slot);
+            int       bestValue = getArmorValue(current);
+
+            if (slot == EquipmentSlot.CHEST && chestplateMode.get() == ChestplateMode.Elytra
+                    && current.is(Items.ELYTRA)) {
+                bestValue = 1_000_000;
+            }
+
+            int bestSlot = -1;
+            for (int j = 0; j < 36; j++) {
+                ItemStack stack = mc.player.getInventory().getItem(j);
+                if (stack.isEmpty()) continue;
+                if (hasIgnoredEnchantment(stack)) continue;
+                var equippable = stack.get(DataComponents.EQUIPPABLE);
+                if (equippable == null || equippable.slot() != slot) continue;
+
+                int value = getArmorValue(stack);
+                if (slot == EquipmentSlot.CHEST && chestplateMode.get() == ChestplateMode.Elytra
+                        && stack.is(Items.ELYTRA)) {
+                    value = 1_000_000;
+                }
+
+                if (value > bestValue) { bestValue = value; bestSlot = j; }
+            }
+
+            if (bestSlot != -1) InvUtils.move().from(bestSlot).toArmor(i);
+        }
+    }
+
+    private void tickSmartChestplate() {
+        if (chestplateMode.get() != ChestplateMode.Smart || mc.player == null) return;
+
+        long now = System.currentTimeMillis();
+        boolean onGround = mc.player.onGround();
+        double currentY = mc.player.getY();
+
+        if (Double.isNaN(lastPlayerY)) {
+            lastPlayerY = currentY;
+        }
+
+        if (wasOnGround && !onGround && currentY > lastPlayerY + 0.1) {
+            jumpTime = now;
+        }
+        lastPlayerY = currentY;
+
+        if (onGround && jumpTime != -1 && (now - jumpTime) < jumpDelayMs.get()) {
+            jumpTime = -1;
+        }
+
+        ItemStack chest = mc.player.getItemBySlot(EquipmentSlot.CHEST);
+        long timeSinceLastSwap = now - lastSwapTime;
+
+        if (manualSwapRequested) {
+            manualSwapRequested = false;
+            if (timeSinceLastSwap >= swapCooldownMs.get()) {
+                if (chest.is(Items.ELYTRA)) {
+                    swapToChestplate();
+                } else {
+                    swapToElytra();
+                }
+                lastSwapTime = now;
+            }
+            wasOnGround = onGround;
+            return;
+        }
+
+        boolean shouldElytra = false;
+
+        if (jumpTime != -1 && (now - jumpTime) >= jumpDelayMs.get() && !onGround) {
+            shouldElytra = true;
+            jumpTime = -1;
+        }
+
+        if (fallDistanceTrigger.get() > 0 && mc.player.fallDistance >= fallDistanceTrigger.get()) {
+            shouldElytra = true;
+        }
+
+        if (shouldElytra && !chest.is(Items.ELYTRA) && timeSinceLastSwap >= swapCooldownMs.get()) {
+            swapToElytra();
+            lastSwapTime = now;
+        }
+
+        if (swapBackOnLand.get() && onGround && !wasOnGround
+                && chest.is(Items.ELYTRA)
+                && timeSinceLastSwap >= swapCooldownMs.get()) {
+            swapToChestplate();
+            lastSwapTime = now;
+        }
+
+        wasOnGround = onGround;
+    }
+
+    private void swapToElytra() {
+        FindItemResult elytra = InvUtils.find(Items.ELYTRA);
+        if (elytra.found()) {
+            InvUtils.move().from(elytra.slot()).toArmor(2);
+            info("Swapped to Elytra.");
+        } else {
+            warning("No elytra found in inventory.");
+        }
+    }
+
+    private void swapToChestplate() {
+        int bestSlot = -1;
+        int bestValue = -1;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty() || hasIgnoredEnchantment(stack)) continue;
+            var equippable = stack.get(DataComponents.EQUIPPABLE);
+            if (equippable == null || equippable.slot() != EquipmentSlot.CHEST) continue;
+            if (stack.is(Items.ELYTRA)) continue;
+
+            int value = getArmorValue(stack);
+            if (value > bestValue) { bestValue = value; bestSlot = i; }
+        }
+
+        if (bestSlot != -1) {
+            InvUtils.move().from(bestSlot).toArmor(2);
+            info("Swapped to Chestplate.");
+        } else {
+            info("No chestplate available to swap to.");
+        }
+    }
+
+    private void tickAutoEat() {
+        if (!autoEat.get()) return;
+
+        if (isDisallowedScreenOpen()) {
+            if (isEating || moveWaitTicks > 0) finishEating();
+            return;
+        }
+
+        if (eatCooldownTimer > 0) {
+            eatCooldownTimer--;
+            return;
+        }
+
+        if (moveWaitTicks > 0) {
+            moveWaitTicks--;
+            if (moveWaitTicks == 0) {
+                ItemStack hotbarStack = mc.player.getInventory().getItem(eatHotbarSlot);
+                if (eatTargetItem != null && hotbarStack.is(eatTargetItem)) {
+                    selectHotbarSlot(eatHotbarSlot);
+                    eatTicksRemaining = hotbarStack.getItem().getUseDuration(hotbarStack, mc.player);
+                    eatStartupTicks = 3;
+                    startEatingItem();
+                    isEating = true;
+                } else {
+                    stopEating();
+                }
+            }
+            return;
+        }
+
+        if (!isEating) {
+            boolean needsHealth = healthThreshold.get() > 0 && mc.player.getHealth() <= healthThreshold.get();
+
+            int currentHunger = mc.player.getFoodData().getFoodLevel();
+
+            if (highestHungerSeen == -1 || currentHunger > highestHungerSeen) {
+                highestHungerSeen = currentHunger;
+            }
+
+            boolean needsHunger = highestHungerSeen != -1 && (highestHungerSeen - currentHunger) >= hungerLoss.get();
+
+            boolean needsFireEat = eatOnFire.get() && mc.player.isOnFire() && tookDamageWhileOnFire && !ateForFire;
+            boolean isHealthEmergency = needsHealth || needsFireEat;
+
+            if (pauseInCombat.get() && tookDamageRecently && !isHealthEmergency) {
+                return;
+            }
+
+            if (!needsHealth && !needsHunger && !needsFireEat) return;
+
+            int foodSlot = findBestFood(isHealthEmergency);
+            if (foodSlot == -1) return;
+
+            ItemStack foodStack = mc.player.getInventory().getItem(foodSlot);
+            eatTargetItem = foodStack.getItem();
+
+            if (skipIfRegen.get() && !isHealthEmergency && (foodStack.is(Items.GOLDEN_APPLE) || foodStack.is(Items.ENCHANTED_GOLDEN_APPLE))) {
+                if (mc.player.hasEffect(MobEffects.REGENERATION)) {
+                    return;
+                }
+            }
+
+            eatOriginalHotbarSlot = getSelectedSlot();
+
+            if (foodSlot < 9) {
+                eatHotbarSlot = foodSlot;
+                selectHotbarSlot(eatHotbarSlot);
+                eatTicksRemaining = foodStack.getItem().getUseDuration(foodStack, mc.player);
+                eatStartupTicks = 3;
+                startEatingItem();
+                isEating = true;
+            } else {
+                eatHotbarSlot = findEmptyHotbarSlot();
+                if (eatHotbarSlot == -1) eatHotbarSlot = eatOriginalHotbarSlot;
+                InvUtils.move().from(foodSlot).toHotbar(eatHotbarSlot);
+                moveWaitTicks = 2;
+            }
+
+            if (needsFireEat) {
+                ateForFire            = true;
+                tookDamageWhileOnFire = false;
+            }
+
+        } else {
+            selectHotbarSlot(eatHotbarSlot);
+            mc.options.keyUse.setDown(true);
+
+            if (eatStartupTicks > 0) {
+                eatStartupTicks--;
+                if (!mc.player.isUsingItem()) {
+                    startEatingItem();
+                }
+                if (eatTicksRemaining > 0) eatTicksRemaining--;
+                return;
+            }
+
+            ItemStack hotbarStack = mc.player.getInventory().getItem(eatHotbarSlot);
+            boolean hotbarHasFood = eatTargetItem != null && hotbarStack.is(eatTargetItem);
+
+            if (!hotbarHasFood) {
+                finishEating();
+                return;
+            }
+
+            if (!mc.player.isUsingItem()) {
+                startEatingItem();
+                eatTicksRemaining = hotbarStack.getItem().getUseDuration(hotbarStack, mc.player);
+                return;
+            }
+
+            if (eatTicksRemaining > 0) {
+                eatTicksRemaining--;
+            } else {
+                finishEating();
+            }
+        }
+    }
+
+    @EventHandler
+    private void onPacketReceive(PacketEvent.Receive event) {
+        if (mc.player == null || mc.level == null || mode.get() != OperationMode.Default || !disconnectOnTotemPop.get()) return;
+
+        if (event.packet instanceof ClientboundEntityEventPacket packet) {
+            if (packet.getEventId() == 35
+                    && packet.getEntity(mc.level) != null
+                    && packet.getEntity(mc.level).getId() == mc.player.getId()) {
+                disconnect("[SHS] Disconnected on totem pop. " + countTotems() + " totems remaining.");
+            }
+        }
+    }
+
+    private void disconnect(String reason) {
+        if (mc.player != null && mc.player.connection != null) {
+            mc.player.connection.getConnection().disconnect(Component.literal(reason));
+        }
+        this.toggle();
+    }
+
+    private int findEmptyHotbarSlot() {
+        for (int i = 0; i < 9; i++) {
+            if (mc.player.getInventory().getItem(i).isEmpty()) return i;
+        }
+        return -1;
+    }
+
+    private int findBestFood(boolean isHealthEmergency) {
+        if (isHealthEmergency) {
+            int egapple = findBestEnchantedGapple();
+            if (egapple != -1) return egapple;
+
+            int gapple = findBestGapple();
+            if (gapple != -1) return gapple;
+
+            return findBestNormalFood();
+        }
+
+        int food = findBestNormalFood();
+        if (food != -1) return food;
+
+        return findBestGapple();
+    }
+
+    private int findBestEnchantedGapple() {
+        int hotbar = -1;
+        int inv = -1;
+        for (int i = 0; i < 36; i++) {
+            if (mc.player.getInventory().getItem(i).is(Items.ENCHANTED_GOLDEN_APPLE)) {
+                if (i < 9) { if (hotbar == -1) hotbar = i; }
+                else { if (inv == -1) inv = i; }
+            }
+        }
+        return hotbar != -1 ? hotbar : inv;
+    }
+
+    private int findBestNormalFood() {
+        int bestSlot = -1;
+        int bestValue = -1;
+
+        int hotbarBest = -1;
+        int hotbarBestValue = -1;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+
+            FoodProperties food = stack.get(DataComponents.FOOD);
+            if (food == null) continue;
+
+            int value = (int) (food.nutrition() + food.saturation() * 10);
+            if (stack.getMaxStackSize() > 1) value += 100;
+
+            if (i < 9) {
+                if (value > hotbarBestValue) {
+                    hotbarBestValue = value;
+                    hotbarBest = i;
+                }
+            } else {
+                if (value > bestValue) {
+                    bestValue = value;
+                    bestSlot = i;
+                }
+            }
+        }
+
+        return hotbarBest != -1 ? hotbarBest : bestSlot;
+    }
+
+    private int findBestGapple() {
+        int hotbarGapple     = -1;
+        int hotbarEgapple    = -1;
+        int inventoryEgapple = -1;
+        int inventoryGapple  = -1;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+
+            if (stack.is(Items.ENCHANTED_GOLDEN_APPLE)) {
+                if (i < 9) {
+                    if (hotbarEgapple == -1) hotbarEgapple = i;
+                } else {
+                    if (inventoryEgapple == -1) inventoryEgapple = i;
+                }
+            } else if (stack.is(Items.GOLDEN_APPLE)) {
+                if (i < 9) {
+                    if (hotbarGapple == -1) hotbarGapple = i;
+                } else {
+                    if (inventoryGapple == -1) inventoryGapple = i;
+                }
+            }
+        }
+
+        if (preferEnchanted.get()) {
+            if (hotbarEgapple != -1) return hotbarEgapple;
+            if (inventoryEgapple != -1) return inventoryEgapple;
+            if (hotbarGapple != -1) return hotbarGapple;
+            return inventoryGapple;
+        } else {
+            if (hotbarGapple != -1) return hotbarGapple;
+            if (inventoryGapple != -1) return inventoryGapple;
+            if (hotbarEgapple != -1) return hotbarEgapple;
+            return inventoryEgapple;
+        }
+    }
+
+    private boolean hasIgnoredEnchantment(ItemStack stack) {
+        if (ignoredEnchantments.get().isEmpty()) return false;
+        ItemEnchantments enchants = stack.get(DataComponents.ENCHANTMENTS);
+        if (enchants == null) return false;
+        for (Holder<Enchantment> entry : enchants.keySet()) {
+            if (entry.unwrapKey().isPresent() && ignoredEnchantments.get().contains(entry.unwrapKey().get())) return true;
+        }
+        return false;
+    }
+
+    private int getArmorValue(ItemStack stack) {
+        if (stack.isEmpty()) return -1;
+        if (stack.getOrDefault(DataComponents.EQUIPPABLE, null) == null) return -1;
+
+        ItemAttributeModifiers attrs = stack.getOrDefault(DataComponents.ATTRIBUTE_MODIFIERS, null);
+        double armor = 0, toughness = 0;
+
+        if (attrs != null) {
+            for (var entry : attrs.modifiers()) {
+                if (entry == null || entry.attribute() == null || entry.modifier() == null) continue;
+                var keyOpt = entry.attribute().unwrapKey();
+                if (keyOpt == null || keyOpt.isEmpty()) continue;
+                String id = keyOpt.get().identifier().toString();
+                double v  = entry.modifier().amount();
+                if      (id.equals("minecraft:generic.armor") || id.equals("minecraft:armor"))                     armor     += v;
+                else if (id.equals("minecraft:generic.armor_toughness") || id.equals("minecraft:armor_toughness")) toughness += v;
+            }
+        }
+
+        double enchBonus =
+              getEnchantmentLevel(stack, "minecraft:protection")            * 3.0
+            + getEnchantmentLevel(stack, "minecraft:fire_protection")       * 1.0
+            + getEnchantmentLevel(stack, "minecraft:projectile_protection") * 1.0;
+
+        return (int) (armor * 100 + toughness * 10 + enchBonus);
+    }
+
+    private int countTotems() {
+        if (mc.player == null) return 0;
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.is(Items.TOTEM_OF_UNDYING)) count += stack.getCount();
+        }
+        if (mc.player.getOffhandItem().is(Items.TOTEM_OF_UNDYING)) {
+            count += mc.player.getOffhandItem().getCount();
+        }
+        return count;
+    }
+
+    private int getEnchantmentLevel(ItemStack stack, String id) {
+        ItemEnchantments enchants = stack.get(DataComponents.ENCHANTMENTS);
+        if (enchants == null) return 0;
+        for (Holder<Enchantment> entry : enchants.keySet()) {
+            if (entry.unwrapKey().isPresent() && entry.unwrapKey().get().identifier().toString().equals(id))
+                return enchants.getLevel(entry);
+        }
+        return 0;
+    }
+
+    private BlockPos findNearestBed() {
+        if (mc.player == null || mc.level == null) return null;
+
+        BlockPos playerPos = mc.player.blockPosition();
+        double minDistanceSq = Double.MAX_VALUE;
+        BlockPos nearestBed = null;
+
+        for (int x = -5; x <= 5; x++) {
+            for (int y = -5; y <= 5; y++) {
+                for (int z = -5; z <= 5; z++) {
+                    BlockPos pos = playerPos.offset(x, y, z);
+                    if (mc.level.getBlockState(pos).getBlock() instanceof BedBlock) {
+                        double distanceSq = playerPos.distSqr(pos);
+                        if (distanceSq < minDistanceSq) {
+                            minDistanceSq = distanceSq;
+                            nearestBed = pos;
+                        }
+                    }
+                }
+            }
+        }
+        return nearestBed;
+    }
+
+    private int findBestTool(BlockPos blockPos) {
+        if (mc.player == null || mc.level == null) return -1;
+
+        BlockState state = mc.level.getBlockState(blockPos);
+        float bestSpeed = 1.0f;
+        int bestSlot = -1;
+
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+
+            float speed = stack.getDestroySpeed(state);
+            if (speed > bestSpeed) { bestSpeed = speed; bestSlot = i; }
+        }
+        return bestSlot;
+    }
+
+    public enum OperationMode {
+        Default,
+        QuickRespawn
+    }
+
+    public enum ChestplateMode {
+        Chestplate,
+        Elytra,
+        Smart
+    }
+
+    public enum IgnoredArmorSlot {
+        None,
+        Helmet,
+        Chestplate,
+        Leggings,
+        Boots,
+        All
+    }
+
+    public static class EatProcess implements IBaritoneProcess {
+        public static final EatProcess INSTANCE = new EatProcess();
+
+        @Override
+        public boolean isActive() {
+            ServerHealthcareSystem shs = Modules.get().get(ServerHealthcareSystem.class);
+            return shs != null && shs.isActive() && shs.isEating() && shs.pauseBaritone.get();
+        }
+
+        @Override
+        public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+
+        @Override
+        public boolean isTemporary() {
+            return false;
+        }
+
+        @Override
+        public void onLostControl() {}
+
+        @Override
+        public String displayName0() {
+            return "SHS Auto Eat";
+        }
+    }
+}

@@ -1,0 +1,794 @@
+package com.example.addon.hud;
+
+import java.util.concurrent.TimeUnit;
+import java.util.ArrayList;
+import java.util.List;
+import com.example.addon.Tim;
+import com.example.addon.modules.RocketPilot;
+
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.ColorSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.systems.hud.HudElement;
+import meteordevelopment.meteorclient.systems.hud.HudElementInfo;
+import meteordevelopment.meteorclient.systems.hud.HudRenderer;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+public class RocketPilotHud extends HudElement {
+    public static final HudElementInfo<RocketPilotHud> INFO = new HudElementInfo<>(
+        Tim.HUD_GROUP,
+        "rocket-pilot",
+        "Displays RocketPilot status, elytra durability, and rocket count.",
+        RocketPilotHud::new
+    );
+
+    private static final Minecraft mc = Minecraft.getInstance();
+
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final Setting<Double> textScale = HudAppearance.addTextScale(sgGeneral);
+    private final Setting<Double> paddingScale = HudAppearance.addPaddingScale(sgGeneral);
+    private final SettingGroup sgElytra  = settings.createGroup("Elytra Warnings");
+    private final SettingGroup sgRockets = settings.createGroup("Rocket Warnings");
+
+    public enum Layout { Inline, Stacked, StackedIcons }
+
+    private final Setting<Layout> layout = sgGeneral.add(new EnumSetting.Builder<Layout>()
+        .name("layout")
+        .description("How the data is presented.")
+        .defaultValue(Layout.StackedIcons)
+        .build()
+    );
+
+    private final Setting<Boolean> textShadow = sgGeneral.add(new BoolSetting.Builder()
+        .name("text-shadow")
+        .description("Enables a shadow/shader effect to make text pop more.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<SettingColor> separatorColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("separator-color")
+        .description("Color of the | separators.")
+        .defaultValue(new SettingColor(100, 100, 100, 255))
+        .visible(() -> layout.get() == Layout.Inline)
+        .build()
+    );
+
+    private final Setting<Double> scale = sgGeneral.add(new DoubleSetting.Builder()
+        .name("scale")
+        .description("Scale of the HUD element.")
+        .defaultValue(1.0)
+        .min(0.25)
+        .sliderRange(0.25, 4.0)
+        .build()
+    );
+
+    public enum Alignment { Left, Center, Right }
+
+    private final Setting<Alignment> alignment = sgGeneral.add(new EnumSetting.Builder<Alignment>()
+        .name("alignment")
+        .description("Align text to the left, center, or right within the element.")
+        .defaultValue(Alignment.Left)
+        .visible(() -> layout.get() != Layout.Inline)
+        .build()
+    );
+
+    public enum LabelMode { Text, Icon, Both }
+
+    private final Setting<LabelMode> labelMode = sgGeneral.add(new EnumSetting.Builder<LabelMode>()
+        .name("label-mode")
+        .description("Show the item label as text, icon, or both.")
+        .defaultValue(LabelMode.Both)
+        .visible(() -> layout.get() == Layout.StackedIcons || layout.get() == Layout.Inline)
+        .build()
+    );
+
+    public enum IconPosition { Left, Right, Above, Below }
+    public enum BarPosition { Above, Below, Left, Right }
+
+    private final Setting<IconPosition> iconPosition = sgGeneral.add(new EnumSetting.Builder<IconPosition>()
+        .name("icon-position")
+        .description("Where the item icon appears relative to the text on each stat row.")
+        .defaultValue(IconPosition.Left)
+        .visible(() -> (layout.get() == Layout.StackedIcons || layout.get() == Layout.Inline) && labelMode.get() != LabelMode.Text)
+        .build()
+    );
+
+    private final Setting<Double> iconScale = sgGeneral.add(new DoubleSetting.Builder()
+        .name("icon-scale")
+        .description("Scale of the item icons.")
+        .defaultValue(1.5)
+        .min(0.5)
+        .sliderRange(0.5, 4.0)
+        .visible(() -> labelMode.get() != LabelMode.Text)
+        .build()
+    );
+
+    private final Setting<Double> iconGapSetting = sgGeneral.add(new DoubleSetting.Builder()
+        .name("icon-gap")
+        .description("Gap in pixels between the icon and the text.")
+        .defaultValue(4.0)
+        .min(0)
+        .sliderRange(0, 16)
+        .visible(() -> labelMode.get() != LabelMode.Text)
+        .build()
+    );
+
+    private final Setting<SettingColor> labelColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("label-color")
+        .description("Color for labels.")
+        .defaultValue(new SettingColor(170, 170, 170, 255))
+        .build()
+    );
+
+    private final Setting<SettingColor> valueColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("value-color")
+        .description("Color for values when healthy.")
+        .defaultValue(new SettingColor(255, 255, 255, 255))
+        .build()
+    );
+
+    private final Setting<Boolean> showBackground = sgGeneral.add(new BoolSetting.Builder()
+        .name("background")
+        .description("Show a background behind each row.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<SettingColor> backgroundColor = sgGeneral.add(new ColorSetting.Builder()
+        .name("background-color")
+        .description("Color of the background.")
+        .defaultValue(new SettingColor(0, 0, 0, 80))
+        .visible(showBackground::get)
+        .build()
+    );
+
+    private final Setting<Boolean> showStatus = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-status")
+        .description("Show the RocketPilot status line.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> showBar = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-bar")
+        .description("Show a color-coded efficiency bar based on rocket consumption.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<BarPosition> barPosition = sgGeneral.add(new EnumSetting.Builder<BarPosition>()
+        .name("bar-position")
+        .description("Where the efficiency bar appears relative to the text/icons.")
+        .defaultValue(BarPosition.Below)
+        .visible(showBar::get)
+        .build()
+    );
+
+    private final Setting<Boolean> showDurability = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-durability")
+        .description("Show the count of usable elytras in inventory.")
+        .defaultValue(true)
+        .build()
+    );
+
+    public enum DistanceUnit { Blocks, Kilometers }
+
+    private final Setting<Boolean> showFlightTime = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-flight-time")
+        .description("Show estimated flight time remaining.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> hideTimeWhenStatic = sgGeneral.add(new BoolSetting.Builder()
+        .name("hide-time-when-static")
+        .description("Hide the flight time estimate when not moving.")
+        .defaultValue(false)
+        .visible(showFlightTime::get)
+        .build()
+    );
+
+    private final Setting<Boolean> showDistance = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-distance")
+        .description("Show estimated distance remaining.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<DistanceUnit> distanceUnit = sgGeneral.add(new EnumSetting.Builder<DistanceUnit>()
+        .name("distance-unit")
+        .description("The unit used to display remaining distance.")
+        .defaultValue(DistanceUnit.Blocks)
+        .visible(showDistance::get)
+        .build()
+    );
+
+    private final Setting<Boolean> showRocketCount = sgGeneral.add(new BoolSetting.Builder()
+        .name("show-rocket-count")
+        .description("Show total firework rockets across the inventory.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> elytraDurabilityThreshold = sgElytra.add(new DoubleSetting.Builder()
+        .name("durability-threshold")
+        .defaultValue(10.0).min(0).sliderRange(0, 100).build()
+    );
+
+    private final Setting<Integer> elytraWarningCount = sgElytra.add(new IntSetting.Builder()
+        .name("warning-count")
+        .defaultValue(2).min(0).sliderRange(0, 20).build()
+    );
+
+    private final Setting<SettingColor> elytraWarningColor = sgElytra.add(new ColorSetting.Builder()
+        .name("warning-color")
+        .defaultValue(new SettingColor(255, 165, 0, 255)).build()
+    );
+
+    private final Setting<Integer> elytraCriticalCount = sgElytra.add(new IntSetting.Builder()
+        .name("critical-count")
+        .defaultValue(1).min(0).sliderRange(0, 10).build()
+    );
+
+    private final Setting<SettingColor> elytraCriticalColor = sgElytra.add(new ColorSetting.Builder()
+        .name("critical-color")
+        .defaultValue(new SettingColor(255, 40, 40, 255)).build()
+    );
+
+    private final Setting<Integer> rocketWarningThreshold = sgRockets.add(new IntSetting.Builder()
+        .name("warning-threshold")
+        .defaultValue(16).min(0).sliderRange(0, 128).build()
+    );
+
+    private final Setting<SettingColor> rocketWarningColor = sgRockets.add(new ColorSetting.Builder()
+        .name("warning-color")
+        .defaultValue(new SettingColor(255, 165, 0, 255)).build()
+    );
+
+    private final Setting<Integer> rocketCriticalThreshold = sgRockets.add(new IntSetting.Builder()
+        .name("critical-threshold")
+        .defaultValue(8).min(0).sliderRange(0, 128).build()
+    );
+
+    private final Setting<SettingColor> rocketCriticalColor = sgRockets.add(new ColorSetting.Builder()
+        .name("critical-color")
+        .defaultValue(new SettingColor(255, 40, 40, 255)).build()
+    );
+
+    private final Setting<Integer> lowFuelThreshold = sgRockets.add(new IntSetting.Builder()
+        .name("low-fuel-threshold")
+        .defaultValue(10).min(1).sliderMax(60)
+        .visible(showFlightTime::get)
+        .build()
+    );
+
+    private long flightStartTime = -1;
+    private int flightStartRockets = -1;
+
+    public RocketPilotHud() { super(INFO); }
+
+    private record Stat(String label, String value, ItemStack icon, SettingColor valColor) {}
+
+    @Override
+    public void render(HudRenderer renderer) {
+        if (mc.player == null) { setSize(0, 0); return; }
+
+        if (layout.get() == Layout.Inline) renderInline(renderer);
+        else renderStacked(renderer, layout.get() == Layout.StackedIcons);
+    }
+
+    private void renderInline(HudRenderer renderer) {
+        double s = scale.get(), padH = (4 * s) * paddingScale.get(), padV = (2 * s) * paddingScale.get();
+        boolean shadow = textShadow.get();
+        double lh = renderer.textHeight(shadow, HudAppearance.textScale(s, textScale.get())), sepW = renderer.textWidth(" | ", shadow, HudAppearance.textScale(s, textScale.get()));
+        double iconSz = 16.0 * iconScale.get(), iconGap = iconGapSetting.get() * s;
+        LabelMode mode = labelMode.get(); boolean showIcon = mode != LabelMode.Text, showLabel = mode != LabelMode.Icon;
+        IconPosition iconPos = iconPosition.get(); double effIconGap = showIcon ? iconGap : 0;
+
+        List<Stat> stats = new ArrayList<>();
+
+        int elytraCount = countElytras();
+        if (showDurability.get() && (elytraCount > 0 || isInEditor())) {
+            SettingColor col = valueColor.get();
+            if (elytraCount <= elytraCriticalCount.get()) col = elytraCriticalColor.get();
+            else if (elytraCount <= elytraWarningCount.get()) col = elytraWarningColor.get();
+            stats.add(new Stat("Elytras: ", String.valueOf(elytraCount), new ItemStack(Items.ELYTRA), col));
+        }
+
+        int currentRockets = countRockets();
+        if (showRocketCount.get() && (currentRockets > 0 || isInEditor())) {
+            SettingColor col = valueColor.get();
+            if (currentRockets <= rocketCriticalThreshold.get()) col = rocketCriticalColor.get();
+            else if (currentRockets <= rocketWarningThreshold.get()) col = rocketWarningColor.get();
+            stats.add(new Stat("Rockets: ", String.valueOf(currentRockets), new ItemStack(Items.FIREWORK_ROCKET), col));
+        }
+
+        if (stats.isEmpty()) { setSize(0, 0); return; }
+
+        double totalW = 0, rowH = showIcon ? Math.max(lh, iconSz) : lh;
+        for (int i = 0; i < stats.size(); i++) {
+            Stat st = stats.get(i);
+            double segW = 0;
+            if (showLabel) segW += renderer.textWidth(st.label, shadow, HudAppearance.textScale(s, textScale.get()));
+            segW += renderer.textWidth(st.value, shadow, HudAppearance.textScale(s, textScale.get()));
+            if (showIcon) segW += iconSz + effIconGap;
+            totalW += segW;
+            if (i < stats.size() - 1) totalW += sepW;
+        }
+        setSize(totalW + padH * 2, rowH + padV * 2);
+        if (showBackground.get()) renderer.quad(x, y, getWidth(), getHeight(), backgroundColor.get());
+
+        double cx = x + padH;
+        for (int i = 0; i < stats.size(); i++) {
+            Stat st = stats.get(i);
+            if (showIcon && iconPos == IconPosition.Left) {
+                renderer.item(st.icon, (int) cx, (int) (y + padV + (rowH - iconSz) / 2.0), iconScale.get().floatValue(), false);
+                cx += iconSz + effIconGap;
+            }
+            if (showLabel) {
+                renderer.text(st.label, cx, y + padV + (rowH - lh) / 2.0, labelColor.get(), shadow, HudAppearance.textScale(s, textScale.get()));
+                cx += renderer.textWidth(st.label, shadow, HudAppearance.textScale(s, textScale.get()));
+            }
+            renderer.text(st.value, cx, y + padV + (rowH - lh) / 2.0, st.valColor, shadow, HudAppearance.textScale(s, textScale.get()));
+            cx += renderer.textWidth(st.value, shadow, HudAppearance.textScale(s, textScale.get()));
+
+            if (showIcon && iconPos != IconPosition.Left) {
+                cx += effIconGap;
+                renderer.item(st.icon, (int) cx, (int) (y + padV + (rowH - iconSz) / 2.0), iconScale.get().floatValue(), false);
+                cx += iconSz;
+            }
+            if (i < stats.size() - 1) {
+                renderer.text(" | ", cx, y + padV + (rowH - lh) / 2.0, separatorColor.get(), shadow, HudAppearance.textScale(s, textScale.get()));
+                cx += sepW;
+            }
+        }
+    }
+
+    private void renderStacked(HudRenderer renderer, boolean withIcons) {
+        RocketPilot rp = Modules.get().get(RocketPilot.class);
+
+        double s          = scale.get();
+        double padH       = (4 * s) * paddingScale.get();
+        double padV       = (2 * s) * paddingScale.get();
+        double rowGap     = 2 * s;
+        boolean shadow    = textShadow.get();
+        double lineHeight = renderer.textHeight(shadow, HudAppearance.textScale(s, textScale.get()));
+        double iconSz     = 16.0 * iconScale.get();
+        double iconGap    = iconGapSetting.get() * s;
+
+        LabelMode    mode     = labelMode.get();
+        IconPosition iconPos  = iconPosition.get();
+        boolean      showIcon = mode != LabelMode.Text;
+        boolean      showText = mode != LabelMode.Icon;
+
+        BarPosition bp = barPosition.get();
+        boolean iconVertical = showIcon && (iconPos == IconPosition.Above || iconPos == IconPosition.Below);
+
+        double statRowH;
+        if (!showIcon) {
+            statRowH = lineHeight;
+        } else if (iconVertical) {
+            statRowH = iconSz + iconGap + lineHeight;
+        } else {
+            statRowH = Math.max(lineHeight, iconSz);
+        }
+
+        double statusRowH = lineHeight;
+
+        String statusValue = null;
+        if (showStatus.get() && rp.isActive()) {
+            RocketPilot.FlightPattern pat = rp.flightPattern.get();
+            statusValue = (pat == RocketPilot.FlightPattern.Manual) ? rp.flightMode.get().toString() : pat.toString();
+        }
+        String statusLabel = "RocketPilot: ";
+        double statusW = statusValue != null
+            ? renderer.textWidth(statusLabel, shadow, HudAppearance.textScale(s, textScale.get())) + renderer.textWidth(statusValue, shadow, HudAppearance.textScale(s, textScale.get()))
+            : 0;
+
+        int elytraCount = countElytras();
+        ItemStack    elytraStack = ItemStack.EMPTY;
+        String       durLabel = null, durValue = null;
+        SettingColor durColor = valueColor.get();
+        if (showDurability.get() && (elytraCount > 0 || isInEditor())) {
+            durLabel = showText ? "Elytras: " : "";
+            durValue = String.valueOf(elytraCount);
+
+            double threshold = elytraDurabilityThreshold.get();
+            for (ItemStack stack : com.example.addon.utils.MinecraftCompat.mainStacks(mc.player.getInventory())) {
+                if (isValidElytra(stack, threshold)) { elytraStack = stack; break; }
+            }
+            if (elytraStack.isEmpty()) {
+                ItemStack chest = mc.player.getItemBySlot(EquipmentSlot.CHEST);
+                if (isValidElytra(chest, threshold)) elytraStack = chest;
+            }
+            if (elytraStack.isEmpty()) elytraStack = new ItemStack(Items.ELYTRA);
+
+            if      (elytraCount <= elytraCriticalCount.get()) durColor = elytraCriticalColor.get();
+            else if (elytraCount <= elytraWarningCount.get())  durColor = elytraWarningColor.get();
+        }
+
+        int currentRockets = countRockets();
+        ItemStack    rocketStack = ItemStack.EMPTY;
+        String       rocketLabel = null, rocketValue = null;
+        SettingColor rocketColor = valueColor.get();
+
+        if ((showRocketCount.get() || showFlightTime.get()) && (currentRockets > 0 || isInEditor())) {
+            String name = "Firework Rocket";
+            for (int i = 0; i < 36; i++) {
+                ItemStack s2 = mc.player.getInventory().getItem(i);
+                if (s2.is(Items.FIREWORK_ROCKET)) { name = s2.getHoverName().getString(); rocketStack = s2; break; }
+            }
+            ItemStack offhand = mc.player.getOffhandItem();
+            if (offhand.is(Items.FIREWORK_ROCKET)) { name = offhand.getHoverName().getString(); rocketStack = offhand; }
+
+            if (showRocketCount.get()) {
+                rocketLabel = showText ? name + ": " : "";
+                rocketValue = String.valueOf(currentRockets);
+                if      (currentRockets <= rocketCriticalThreshold.get()) rocketColor = rocketCriticalColor.get();
+                else if (currentRockets <= rocketWarningThreshold.get())  rocketColor = rocketWarningColor.get();
+            }
+        }
+
+        String timeLabel = null, timeValue = null;
+        SettingColor timeColor = valueColor.get();
+        String distLabel = null, distValue = null;
+        double efficiency = 1.0;
+        SettingColor distColor = valueColor.get();
+
+        if ((showFlightTime.get() || showDistance.get()) && rp.isActive() && (currentRockets > 0 || isInEditor())) {
+            boolean moving = mc.player.getDeltaMovement().lengthSqr() > 0.0001;
+
+            if (!hideTimeWhenStatic.get() || moving) {
+                if (flightStartTime == -1 || currentRockets > flightStartRockets) {
+                    flightStartTime = System.currentTimeMillis();
+                    flightStartRockets = currentRockets;
+                }
+
+                int used = flightStartRockets - currentRockets;
+                long elapsed = System.currentTimeMillis() - flightStartTime;
+
+                if (used > 0 && elapsed > 1000) {
+                    double msPerRocket = (double) elapsed / used;
+                    long msRemaining = (long) (currentRockets * msPerRocket);
+                    
+                    efficiency = (double) currentRockets / flightStartRockets;
+
+                    if (showFlightTime.get()) {
+                        long hrs = TimeUnit.MILLISECONDS.toHours(msRemaining);
+                        long mins = TimeUnit.MILLISECONDS.toMinutes(msRemaining) % 60;
+                        long secs = TimeUnit.MILLISECONDS.toSeconds(msRemaining) % 60;
+                        timeLabel = showText ? "Est. Flight: " : "";
+                        timeValue = hrs > 0 ? String.format("%02d:%02d:%02d", hrs, mins, secs) : String.format("%02d:%02d", mins, secs);
+                        if (TimeUnit.MILLISECONDS.toMinutes(msRemaining) < lowFuelThreshold.get()) timeColor = rocketCriticalColor.get();
+                    }
+
+                    if (showDistance.get()) {
+                        double speed = mc.player.getDeltaMovement().length() * 20.0;
+                        double estDist = (msRemaining / 1000.0) * speed;
+                        distLabel = showText ? "Est. Distance: " : "";
+                        if (distanceUnit.get() == DistanceUnit.Kilometers) {
+                            distValue = String.format("%.2f km", estDist / 1000.0);
+                        } else {
+                            distValue = estDist >= 1000 ? String.format("%.1fk blocks", estDist / 1000.0) : String.format("%.0f blocks", estDist);
+                        }
+                        distColor = timeColor;
+                    }
+                } else {
+                    if (showFlightTime.get()) { timeLabel = showText ? "Est. Flight: " : ""; timeValue = "Calculating..."; }
+                    if (showDistance.get())   { distLabel = showText ? "Est. Distance: " : ""; distValue = "Calculating..."; }
+                }
+            }
+        } else {
+            flightStartTime = -1;
+        }
+
+        boolean hasStatus = statusValue != null;
+        boolean hasDur    = durLabel    != null;
+        boolean hasRocket = rocketLabel != null;
+        boolean hasTime   = timeValue   != null;
+        boolean hasDist   = distValue   != null;
+
+        if (!hasStatus && !hasDur && !hasRocket && !hasTime && !hasDist) { setSize(0, 0); return; }
+
+        double durTextW    = durLabel    != null ? renderer.textWidth(durLabel,    shadow, HudAppearance.textScale(s, textScale.get())) + renderer.textWidth(durValue,    shadow, HudAppearance.textScale(s, textScale.get())) : 0;
+        double rocketTextW = rocketLabel != null ? renderer.textWidth(rocketLabel, shadow, HudAppearance.textScale(s, textScale.get())) + renderer.textWidth(rocketValue, shadow, HudAppearance.textScale(s, textScale.get())) : 0;
+        double timeTextW   = timeLabel   != null ? renderer.textWidth(timeLabel,   shadow, HudAppearance.textScale(s, textScale.get())) + renderer.textWidth(timeValue,   shadow, HudAppearance.textScale(s, textScale.get())) : 0;
+        double distTextW   = distLabel   != null ? renderer.textWidth(distLabel,   shadow, HudAppearance.textScale(s, textScale.get())) + renderer.textWidth(distValue,   shadow, HudAppearance.textScale(s, textScale.get())) : 0;
+
+        double effectiveIconGap = (showIcon && showText) ? iconGap : 0;
+
+        double durW, rocketW, timeW, distW;
+        if (!showIcon || iconVertical) {
+            durW    = durLabel    != null ? (showIcon && !elytraStack.isEmpty() ? Math.max(iconSz, durTextW)    : durTextW)    : 0;
+            rocketW = rocketLabel != null ? (showIcon && !rocketStack.isEmpty() ? Math.max(iconSz, rocketTextW) : rocketTextW) : 0;
+            timeW   = timeLabel   != null ? (showIcon ? Math.max(iconSz, timeTextW) : timeTextW) : 0;
+            distW   = distLabel   != null ? (showIcon ? Math.max(iconSz, distTextW) : distTextW) : 0;
+        } else {
+            double durIconW    = (showIcon && !elytraStack.isEmpty())  ? iconSz + effectiveIconGap : 0;
+            double rocketIconW = (showIcon && !rocketStack.isEmpty())  ? iconSz + effectiveIconGap : 0;
+            double timeIconW   = showIcon ? iconSz + effectiveIconGap : 0;
+            double distIconW   = showIcon ? iconSz + effectiveIconGap : 0;
+            durW    = durLabel    != null ? durIconW    + durTextW    : 0;
+            rocketW = rocketLabel != null ? rocketIconW + rocketTextW : 0;
+            timeW   = timeLabel   != null ? timeIconW   + timeTextW   : 0;
+            distW   = distLabel   != null ? distIconW   + distTextW   : 0;
+        }
+
+        double contentW = Math.max(statusW, Math.max(durW, Math.max(rocketW, Math.max(timeW, distW))));
+        if (showIcon && !showText) contentW = Math.max(contentW, iconSz);
+        double totalW   = contentW + padH * 2;
+        
+        double contentH = (hasStatus ? statusRowH + rowGap : 0)
+                        + (hasDur ? statRowH + rowGap : 0)
+                        + (hasRocket ? statRowH + rowGap : 0)
+                        + (hasTime ? statRowH + rowGap : 0)
+                        + (hasDist ? statRowH + rowGap : 0)
+                        - rowGap;
+
+        double barSize = 3 * s;
+        double barGap  = 3 * s;
+        boolean barVertical = bp == BarPosition.Left || bp == BarPosition.Right;
+
+        double totalH = contentH + padV * 2;
+
+        if (showBar.get()) {
+            if (barVertical) totalW += barSize + barGap;
+            else             totalH += barSize + barGap;
+        }
+
+        Alignment align       = alignment.get();
+        boolean   rightAlign  = align == Alignment.Right;
+        boolean   centerAlign = align == Alignment.Center;
+
+        if (showBackground.get())
+            renderer.quad(x, y, totalW, totalH, backgroundColor.get());
+
+        double contentX = x + padH;
+        double contentY = y + padV;
+
+        if (showBar.get()) {
+            if (bp == BarPosition.Left) contentX += barSize + barGap;
+            if (bp == BarPosition.Above) contentY += barSize + barGap;
+        }
+
+        double curX = contentX - padH;
+        double contentRowW = contentW + padH * 2;
+        double curY = contentY;
+
+        if (hasStatus) {
+            drawTextRow(renderer, s, curX, curY, contentRowW, padH, statusRowH, lineHeight, shadow,
+                rightAlign, centerAlign, statusW,
+                statusLabel, statusValue, labelColor.get(), valueColor.get());
+            curY += statusRowH + rowGap;
+        }
+
+        if (hasDur) {
+            drawStatRow(renderer, s, curX, curY, contentRowW, padH, statRowH, lineHeight, shadow,
+                rightAlign, centerAlign, durW, durTextW,
+                showIcon ? elytraStack : ItemStack.EMPTY, iconSz, effectiveIconGap, iconPos,
+                durLabel, durValue, labelColor.get(), durColor);
+            curY += statRowH + rowGap;
+        }
+
+        if (hasRocket) {
+            drawStatRow(renderer, s, curX, curY, contentRowW, padH, statRowH, lineHeight, shadow,
+                rightAlign, centerAlign, rocketW, rocketTextW,
+                showIcon ? rocketStack : ItemStack.EMPTY, iconSz, effectiveIconGap, iconPos,
+                rocketLabel, rocketValue, labelColor.get(), rocketColor);
+            curY += statRowH + rowGap;
+        }
+
+        if (hasTime) {
+            drawStatRow(renderer, s, curX, curY, contentRowW, padH, statRowH, lineHeight, shadow,
+                rightAlign, centerAlign, timeW, timeTextW,
+                showIcon ? new ItemStack(Items.CLOCK) : ItemStack.EMPTY, iconSz, effectiveIconGap, iconPos,
+                timeLabel, timeValue, labelColor.get(), timeColor);
+            curY += statRowH + rowGap;
+        }
+
+        if (hasDist) {
+            drawStatRow(renderer, s, curX, curY, contentRowW, padH, statRowH, lineHeight, shadow,
+                rightAlign, centerAlign, distW, distTextW,
+                showIcon ? new ItemStack(Items.COMPASS) : ItemStack.EMPTY, iconSz, effectiveIconGap, iconPos,
+                distLabel, distValue, labelColor.get(), distColor);
+        }
+
+        if (showBar.get()) {
+            double bx, by, bw, bh;
+            SettingColor bCol = efficiency > 0.5 ? valueColor.get() : efficiency > 0.2 ? rocketWarningColor.get() : rocketCriticalColor.get();
+            
+            if (!barVertical) {
+                bw = contentW;
+                bh = barSize;
+                bx = contentX;
+                by = (bp == BarPosition.Above) ? contentY - barGap - bh : contentY + contentH + barGap;
+
+                renderer.quad(bx, by, bw, bh, new Color(0, 0, 0, 100));
+                renderer.quad(bx, by, bw * efficiency, bh, bCol);
+            } else {
+                bw = barSize;
+                bh = contentH;
+                bx = (bp == BarPosition.Left) ? contentX - barGap - bw : contentX + contentW + barGap;
+                by = contentY;
+
+                renderer.quad(bx, by, bw, bh, new Color(0, 0, 0, 100));
+                double progressH = bh * efficiency;
+                renderer.quad(bx, by + (bh - progressH), bw, progressH, bCol);
+            }
+        }
+
+        setSize(totalW, totalH);
+    }
+
+    private void drawTextRow(HudRenderer renderer, double s,
+                             double rx, double ry, double totalW, double padH,
+                             double rowH, double lineHeight, boolean shadow,
+                             boolean rightAlign, boolean centerAlign,
+                             double lineW,
+                             String label, String value,
+                             SettingColor lColor, SettingColor vColor) {
+
+        double textY = ry + (rowH - lineHeight) / 2.0;
+
+        if (showBackground.get())
+            renderer.quad(rx, ry - 1, totalW, rowH + 2, backgroundColor.get());
+
+        if (rightAlign) {
+            double cx = rx + totalW - padH;
+            cx -= renderer.textWidth(value, shadow, HudAppearance.textScale(s, textScale.get()));
+            renderer.text(value, cx, textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+            cx -= renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get()));
+            renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+        } else {
+            double cx = centerAlign ? rx + (totalW - lineW) / 2.0 : rx + padH;
+            renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+            renderer.text(value, cx + renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get())), textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+        }
+    }
+
+    private void drawStatRow(HudRenderer renderer, double s,
+                             double rx, double ry, double totalW, double padH,
+                             double rowH, double lineHeight, boolean shadow,
+                             boolean rightAlign, boolean centerAlign,
+                             double lineW, double textW,
+                             ItemStack icon, double iconSz, double iconGap,
+                             IconPosition iconPos,
+                             String label, String value,
+                             SettingColor lColor, SettingColor vColor) {
+
+        boolean hasIcon = !icon.isEmpty();
+
+        if (showBackground.get())
+            renderer.quad(rx, ry - 1, totalW, rowH + 2, backgroundColor.get());
+
+        if (!hasIcon || iconPos == IconPosition.Left || iconPos == IconPosition.Right) {
+            double textY = ry + (rowH - lineHeight) / 2.0;
+            double iconY = ry + (rowH - iconSz)     / 2.0;
+
+            if (rightAlign) {
+                double cx = rx + totalW - padH;
+                if (iconPos == IconPosition.Right && hasIcon) {
+                    renderer.item(icon, (int)(cx - iconSz), (int) iconY, iconScale.get().floatValue(), false);
+                    cx -= iconSz + iconGap;
+                }
+                if (value != null && !value.isEmpty()) {
+                    cx -= renderer.textWidth(value, shadow, HudAppearance.textScale(s, textScale.get()));
+                    renderer.text(value, cx, textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (label != null && !label.isEmpty()) {
+                    cx -= renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get()));
+                    renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (iconPos == IconPosition.Left && hasIcon) {
+                    cx -= iconGap + iconSz;
+                    renderer.item(icon, (int) cx, (int) iconY, iconScale.get().floatValue(), false);
+                }
+            } else {
+                double cx = centerAlign ? rx + (totalW - lineW) / 2.0 : rx + padH;
+                if (iconPos == IconPosition.Left && hasIcon) {
+                    renderer.item(icon, (int) cx, (int) iconY, iconScale.get().floatValue(), false);
+                    cx += iconSz + iconGap;
+                }
+                if (label != null && !label.isEmpty()) {
+                    renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                    cx += renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (value != null && !value.isEmpty()) {
+                    renderer.text(value, cx, textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                    cx += renderer.textWidth(value, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (iconPos == IconPosition.Right && hasIcon) {
+                    cx += iconGap;
+                    renderer.item(icon, (int) cx, (int)(ry + (rowH - iconSz) / 2.0), iconScale.get().floatValue(), false);
+                }
+            }
+
+        } else {
+            double iconY, textY;
+            if (iconPos == IconPosition.Above) {
+                iconY = ry;
+                textY = ry + iconSz + iconGap;
+            } else {
+                textY = ry;
+                iconY = ry + lineHeight + iconGap;
+            }
+
+            double iconX;
+            if (rightAlign) {
+                iconX = rx + totalW - padH - iconSz;
+            } else if (centerAlign) {
+                iconX = rx + (totalW - iconSz) / 2.0;
+            } else {
+                iconX = rx + padH + (textW - iconSz) / 2.0;
+                if (iconX < rx + padH) iconX = rx + padH;
+            }
+            if (hasIcon)
+                renderer.item(icon, (int) iconX, (int) iconY, iconScale.get().floatValue(), false);
+
+            if (rightAlign) {
+                double cx = rx + totalW - padH;
+                if (value != null && !value.isEmpty()) {
+                    cx -= renderer.textWidth(value, shadow, HudAppearance.textScale(s, textScale.get()));
+                    renderer.text(value, cx, textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (label != null && !label.isEmpty()) {
+                    cx -= renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get()));
+                    renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+            } else {
+                double cx = centerAlign ? rx + (totalW - textW) / 2.0 : rx + padH;
+                if (label != null && !label.isEmpty()) {
+                    renderer.text(label, cx, textY, lColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                    cx += renderer.textWidth(label, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+                if (value != null && !value.isEmpty()) {
+                    renderer.text(value, cx, textY, vColor, shadow, HudAppearance.textScale(s, textScale.get()));
+                }
+            }
+        }
+    }
+
+    private int countRockets() {
+        if (mc.player == null) return 0;
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = mc.player.getInventory().getItem(i);
+            if (s.is(Items.FIREWORK_ROCKET)) count += s.getCount();
+        }
+        ItemStack offhand = mc.player.getOffhandItem();
+        if (offhand.is(Items.FIREWORK_ROCKET)) count += offhand.getCount();
+        return count;
+    }
+
+    private int countElytras() {
+        if (mc.player == null) return 0;
+        int count = 0;
+        double threshold = elytraDurabilityThreshold.get();
+
+        for (ItemStack stack : com.example.addon.utils.MinecraftCompat.mainStacks(mc.player.getInventory())) {
+            if (isValidElytra(stack, threshold)) count++;
+        }
+        if (isValidElytra(mc.player.getItemBySlot(EquipmentSlot.CHEST), threshold)) count++;
+        if (isValidElytra(mc.player.getOffhandItem(), threshold)) count++;
+
+        return count;
+    }
+
+    private boolean isValidElytra(ItemStack stack, double threshold) {
+        if (stack == null || stack.isEmpty() || !stack.is(Items.ELYTRA)) return false;
+        if (!stack.isDamageableItem()) return true;
+        double pct = 100.0 * (stack.getMaxDamage() - stack.getDamageValue()) / stack.getMaxDamage();
+        return pct > threshold;
+    }
+}

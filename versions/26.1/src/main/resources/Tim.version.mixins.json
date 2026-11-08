@@ -1,0 +1,24 @@
+{
+  "required": true,
+  "refmap": "Tim.refmap.json",
+  "package": "com.example.addon.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [],
+  "client": [
+    "RocketPilotInputMixin",
+    "OceanBreachMovementMixin",
+    "ThirdSightMouseMixin",
+    "ClientPlayerEntityMixin",
+    "HandmoldMixin",
+    "HeldItemRendererAccessor",
+    "IllumoodEnvironmentAttributeMixin",
+    "IllumoodFogRendererMixin",
+    "BookEditScreenModernAccessor",
+    "BookSigningScreenAccessor",
+    "RocketPilotMixin",
+    "HandledScreenMouseMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

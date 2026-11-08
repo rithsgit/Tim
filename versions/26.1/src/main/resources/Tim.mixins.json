@@ -1,0 +1,53 @@
+{
+  "required": true,
+  "refmap": "Tim.refmap.json",
+  "package": "com.example.addon.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EndGatewayBlockEntityAccessor",
+    "PortalMakerMixin",
+    "AbstractClientPlayerEntityMixin",
+    "InteractionAccessor",
+    "PlayerInventoryAccessor",
+    "PortalTrackerMixin"
+  ],
+  "client": [
+    "ChunkBatchSizeCalculatorMixin",
+    "DatamineMixin",
+    "DatamineWorldMixin",
+    "ElytraAssistantMixin",
+    "ElytraAssistantSwingMixin",
+    "EntityGlowingColorMixin",
+    "EntityGlowingMixin",
+    "EntityMixin",
+    "HandledScreenAccessor",
+    "HandledScreenMixin",
+    "HighlighterRegistryMixin",
+    "HandmoldBobMixin",
+    "HeldItemRendererAccessor",
+    "IMouseAccessor",
+    "InactivityFpsLimiterMixin",
+    "InGameHudMixin",
+    "IllumoodEnvironmentMixin",
+    "IllumoodLightmapMixin",
+    "IllumoodTerrainObfuscatorMixin",
+    "GameRendererLightmapAccessor",
+    "KeyBindingAccessor",
+    "LightmapTextureManagerAccessor",
+    "BookEditScreenAccessor",
+    "LivingEntityRendererMixin",
+    "MixinSignBlockEntityRenderer",
+    "PlayerEntityRendererMixin",
+    "RecipeBookWidgetAccessor",
+    "SettingTitleAccessor",
+    "ThirdSightCameraMixin",
+    "TunnelersMixin",
+    "TweakerGhostHandsMixin",
+    "TweakerPortalMixin",
+    "TweakerSafeWalkMixin",
+    "TweakerSafeWalkInputMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

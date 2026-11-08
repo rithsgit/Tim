@@ -20,8 +20,22 @@ jobs:
           distribution: 'temurin'
           java-version: 21
 
-      - name: Build with Gradle
-        run: ./gradlew build
+      - name: Build 1.21 targets
+        run: |
+          for version in 1.21.4 1.21.5 1.21.8 1.21.11; do
+            ./gradlew build -Pminecraft_version="$version"
+          done
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 25
+
+      - name: Build 26.1 target
+        run: |
+          bash versions/26.1/gradlew -p versions/26.1 build
+          cp versions/26.1/build/libs/tim-*+mc26.1.jar build/libs/
 
       - name: Release
         uses: softprops/action-gh-release@v2

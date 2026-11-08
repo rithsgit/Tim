@@ -1,0 +1,610 @@
+package com.example.addon.modules;
+
+import java.lang.reflect.Method;
+
+import com.example.addon.Tim;
+
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
+import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.settings.StringSetting;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.orbit.EventHandler;
+import net.minecraft.SharedConstants;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+
+public class Handhold extends Module {
+    
+    // ─── Enums ────────────────────────────────────────────────────────────────────
+    public enum Role { Leader, Follower }
+    public enum OrbitSide { Left, Right }
+    public enum FlightVariant { None, RocketPilot, HappyGhast }
+    
+    private enum FollowerState { 
+        TRACKING,        
+        PANIC_BOOST,     
+        WAITING          
+    }
+    
+    private enum LeaderState {
+        NORMAL,
+        SLOWING_DOWN
+    }
+
+    // ─── Setting Groups ───────────────────────────────────────────────────────────
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgRotation = settings.createGroup("Rotation");
+    private final SettingGroup sgSafety = settings.createGroup("Safety");
+
+    // ─── General Settings ─────────────────────────────────────────────────────────
+    public final Setting<String> targetName = sgGeneral.add(new StringSetting.Builder()
+        .name("target")
+        .description("Leader's name if you are Follower, Follower's name if you are Leader.")
+        .defaultValue("")
+        .build()
+    );
+
+    private final Setting<Role> role = sgGeneral.add(new EnumSetting.Builder<Role>()
+        .name("role")
+        .description("Are you leading the flight, or following?")
+        .defaultValue(Role.Follower)
+        .onChanged(v -> {
+            if (v == Role.Leader) info("Leader mode: Watching for disconnects.");
+            else info("Follower mode: Tracking target.");
+        })
+        .build()
+    );
+
+    // Dynamic 1.21.11 setting (visible exclusively on 1.21.11, idles safely on 1.21.4)
+    private final Setting<FlightVariant> flightVariant = sgGeneral.add(new EnumSetting.Builder<FlightVariant>()
+        .name("flight-variant")
+        .description("Select external flight integration style (None, Rocket Pilot, or Happy Ghast mode).")
+        .defaultValue(FlightVariant.None)
+        .visible(() -> isVersion12111())
+        .build()
+    );
+
+    private final Setting<Boolean> disableWhenTargetLands = sgGeneral.add(new BoolSetting.Builder()
+        .name("disable-when-target-lands")
+        .description("Disable Handhold and Rocket Pilot when the target stops flying")
+        .defaultValue(true)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    // ─── Leader Pace Control Settings ─────────────────────────────────────────────
+    private final Setting<Boolean> enablePaceControl = sgGeneral.add(new BoolSetting.Builder()
+        .name("pace-control")
+        .description("Automatically slow down if you pull too far ahead of the follower.")
+        .defaultValue(true)
+        .visible(() -> role.get() == Role.Leader)
+        .build()
+    );
+
+    private final Setting<Double> maxLeadDistance = sgGeneral.add(new DoubleSetting.Builder()
+        .name("max-lead-distance")
+        .description("Horizontal distance before starting to slow down.")
+        .defaultValue(50.0)
+        .min(10.0).max(128.0)
+        .sliderRange(20.0, 100.0)
+        .visible(() -> role.get() == Role.Leader && enablePaceControl.get())
+        .build()
+    );
+
+    private final Setting<Double> resumeDistance = sgGeneral.add(new DoubleSetting.Builder()
+        .name("resume-distance")
+        .description("Horizontal distance to the follower before resuming normal speed.")
+        .defaultValue(30.0)
+        .min(5.0).max(100.0)
+        .sliderRange(10.0, 50.0)
+        .visible(() -> role.get() == Role.Leader && enablePaceControl.get())
+        .build()
+    );
+
+    private final Setting<Double> slowdownPitch = sgGeneral.add(new DoubleSetting.Builder()
+        .name("slowdown-pitch")
+        .description("How aggressively to pitch up to bleed speed (negative = up).")
+        .defaultValue(-35.0)
+        .min(-60.0).max(-5.0)
+        .sliderRange(-50.0, -10.0)
+        .visible(() -> role.get() == Role.Leader && enablePaceControl.get())
+        .build()
+    );
+
+    // ─── Proximity & Orbiting Settings (Follower) ─────────────────────────────────
+    private final Setting<Double> minFollowDistance = sgGeneral.add(new DoubleSetting.Builder()
+        .name("min-follow-distance")
+        .description("If closer than this, orbit instead of aiming directly at them.")
+        .defaultValue(5.0)
+        .min(1.0).max(20.0)
+        .sliderRange(1.0, 10.0)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<Double> orbitOffset = sgGeneral.add(new DoubleSetting.Builder()
+        .name("orbit-offset")
+        .description("How many degrees to shift your yaw when orbiting too close.")
+        .defaultValue(25.0)
+        .min(5.0).max(90.0)
+        .sliderRange(10.0, 45.0)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<OrbitSide> orbitSide = sgGeneral.add(new EnumSetting.Builder<OrbitSide>()
+        .name("orbit-side")
+        .description("Which side to orbit on when you get too close.")
+        .defaultValue(OrbitSide.Left)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    // ─── Rotation Settings (Follower) ─────────────────────────────────────────────
+    private final Setting<Boolean> lookAtTarget = sgRotation.add(new BoolSetting.Builder()
+        .name("look-at-target")
+        .description("Always keep your camera aimed at the target.")
+        .defaultValue(true)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<Double> rotationSpeed = sgRotation.add(new DoubleSetting.Builder()
+        .name("rotation-speed")
+        .description("How smoothly to turn towards the target (lower = smoother).")
+        .defaultValue(0.1)
+        .min(0.01).max(1.0)
+        .sliderRange(0.02, 0.5)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<Boolean> limitRotationSpeed = sgRotation.add(new BoolSetting.Builder()
+        .name("limit-rotation-speed")
+        .description("Caps rotation speed per tick to reduce anti-cheat flags.")
+        .defaultValue(true)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<Double> maxRotationPerTick = sgRotation.add(new DoubleSetting.Builder()
+        .name("max-rotation-per-tick")
+        .description("Maximum degrees to rotate per tick.")
+        .defaultValue(20.0)
+        .min(1.0).max(90.0)
+        .sliderRange(5.0, 45.0)
+        .visible(() -> limitRotationSpeed.get() && role.get() == Role.Follower)
+        .build()
+    );
+
+    // ─── Safety Settings ──────────────────────────────────────────────────────────
+    private final Setting<Boolean> safetyDisconnect = sgSafety.add(new BoolSetting.Builder()
+        .name("safety-disconnect")
+        .description("Triggers a panic rocket towards their last location, then DCs if they aren't found.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> disconnectDelay = sgSafety.add(new DoubleSetting.Builder()
+        .name("disconnect-delay")
+        .description("Seconds to fly towards last location before giving up and disconnecting.")
+        .defaultValue(4.0)
+        .min(1.0).max(15.0)
+        .sliderRange(1.0, 10.0)
+        .visible(safetyDisconnect::get)
+        .build()
+    );
+
+    private final Setting<Boolean> pauseOnObstacle = sgSafety.add(new BoolSetting.Builder()
+        .name("pause-on-obstacle")
+        .description("Stops looking at target if a wall is in the way.")
+        .defaultValue(true)
+        .visible(() -> role.get() == Role.Follower)
+        .build()
+    );
+
+    private final Setting<Integer> obstaclePauseTicks = sgSafety.add(new IntSetting.Builder()
+        .name("obstacle-pause-ticks")
+        .description("How many ticks to pause tracking when an obstacle is hit.")
+        .defaultValue(15)
+        .min(5).max(40)
+        .sliderRange(5, 40)
+        .visible(() -> pauseOnObstacle.get() && role.get() == Role.Follower)
+        .build()
+    );
+
+    // ─── Internal State ───────────────────────────────────────────────────────────
+    private static Method getFlagMethod;
+
+    static {
+        try {
+            getFlagMethod = Entity.class.getDeclaredMethod("getFlag", int.class);
+            getFlagMethod.setAccessible(true);
+        } catch (NoSuchMethodException e) {
+            try {
+                getFlagMethod = Entity.class.getDeclaredMethod("method_5715", int.class);
+                getFlagMethod.setAccessible(true);
+            } catch (Exception ignored) {
+                Tim.LOG.error("Failed to find getFlag method", e);
+            }
+        }
+    }
+
+    private boolean wasTargetFlying = false;
+    private boolean forcedRocketPilot = false;
+    private int obstaclePauseTimer = 0;
+    private boolean hasWarnedNotFound = false;
+    private boolean wasInWorld = false;
+
+    // Follower State Machine
+    private FollowerState followerState = FollowerState.TRACKING;
+    private float lastKnownYaw = 0;
+    private int panicTimer = 0;
+    private int waitTimerTicks = 0;
+    private boolean hasFiredPanicRocket = false;
+
+    // Leader State Machine
+    private LeaderState leaderState = LeaderState.NORMAL;
+    private RocketPilot.FlightMode savedRpMode = RocketPilot.FlightMode.Normal;
+    private boolean savedRpTargetY = true;
+
+    public Handhold() {
+        super(Tim.CATEGORY, "handhold", "Follow a player or lead with mutual safety disconnects.");
+    }
+
+    private static boolean isVersion12111() {
+        try {
+            String name = com.example.addon.utils.MinecraftApiCompat.gameVersionName();
+            return name != null && (name.contains("1.21.11") || name.contains("26."));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    @Override
+    public void onActivate() {
+        wasTargetFlying = false;
+        forcedRocketPilot = false;
+        obstaclePauseTimer = 0;
+        hasWarnedNotFound = false;
+        wasInWorld = false;
+        resetFollowerPanicState();
+        resetLeaderSlowdownState();
+        
+        if (role.get() == Role.Leader) info("Leading %s. Watching for disconnects.", targetName.get());
+        else info("Following %s.", targetName.get());
+    }
+
+    @Override
+    public void onDeactivate() {
+        if (forcedRocketPilot) {
+            RocketPilot rp = Modules.get().get(RocketPilot.class);
+            if (rp != null && rp.isActive()) rp.toggle();
+            forcedRocketPilot = false;
+        }
+        resetFollowerPanicState();
+        resetLeaderSlowdownState();
+    }
+
+    private void resetFollowerPanicState() {
+        followerState = FollowerState.TRACKING;
+        lastKnownYaw = 0;
+        panicTimer = 0;
+        waitTimerTicks = 0;
+        hasFiredPanicRocket = false;
+    }
+
+    private void resetLeaderSlowdownState() {
+        if (leaderState == LeaderState.SLOWING_DOWN) {
+            restoreRocketPilot();
+        }
+        leaderState = LeaderState.NORMAL;
+    }
+
+    private void overrideRocketPilot() {
+        RocketPilot rp = Modules.get().get(RocketPilot.class);
+        if (rp != null && rp.isActive()) {
+            savedRpMode = rp.flightMode.get();
+            savedRpTargetY = rp.useTargetY.get();
+            
+            rp.flightMode.set(RocketPilot.FlightMode.None);
+            rp.useTargetY.set(false);
+        }
+    }
+
+    private void restoreRocketPilot() {
+        RocketPilot rp = Modules.get().get(RocketPilot.class);
+        if (rp != null && rp.isActive()) {
+            rp.flightMode.set(savedRpMode);
+            rp.useTargetY.set(savedRpTargetY);
+        }
+    }
+
+    private Player getTarget() {
+        if (targetName.get() == null || targetName.get().isEmpty()) return null;
+        if (mc.level == null) return null;
+
+        for (Player player : mc.level.players()) {
+            if (player != mc.player &&
+                player.getName().getString().equalsIgnoreCase(targetName.get())) {
+                return player;
+            }
+        }
+        return null;
+    }
+
+    private boolean isFallFlying(Entity entity) {
+        if (getFlagMethod == null) return false;
+        try {
+            return (boolean) getFlagMethod.invoke(entity, 7);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void forceDisconnect(String reason) {
+        if (mc.player != null && mc.player.connection != null && mc.player.connection.getConnection() != null) {
+            mc.player.connection.getConnection().disconnect(Component.nullToEmpty(reason));
+        }
+    }
+
+    private void firePanicRocket() {
+        if (hasFiredPanicRocket || !mc.player.isFallFlying()) return;
+
+        if (mc.player.getOffhandItem().is(Items.FIREWORK_ROCKET)) {
+            mc.gameMode.useItem(mc.player, InteractionHand.OFF_HAND);
+            hasFiredPanicRocket = true;
+            return;
+        }
+
+        FindItemResult rocketResult = InvUtils.findInHotbar(Items.FIREWORK_ROCKET);
+        if (rocketResult.found()) {
+            int prevSlot = com.example.addon.utils.MinecraftCompat.selectedSlot(mc.player.getInventory());
+            InvUtils.swap(rocketResult.slot(), false);
+            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
+            InvUtils.swap(prevSlot, false);
+            hasFiredPanicRocket = true;
+        }
+    }
+
+    private void lookAtSmooth(Vec3 target) {
+        Vec3 diff = target.subtract(mc.player.getEyePosition());
+        if (diff.lengthSqr() < 0.01) return;
+
+        double targetYawExact = Math.toDegrees(Math.atan2(-diff.x, diff.z));
+        float targetYaw = (float) targetYawExact;
+        
+        double horizontalDist = Math.sqrt(diff.x * diff.x + diff.z * diff.z);
+        
+        if (horizontalDist < minFollowDistance.get()) {
+            float offset = orbitOffset.get().floatValue();
+            if (orbitSide.get() == OrbitSide.Right) offset = -offset;
+            targetYaw += offset;
+        }
+        
+        float currentYaw = mc.player.getYRot();
+        float diffYaw = Mth.wrapDegrees(targetYaw - currentYaw);
+        
+        float desiredChange = diffYaw * rotationSpeed.get().floatValue();
+        
+        if (limitRotationSpeed.get()) {
+            desiredChange = Mth.clamp(desiredChange, 
+                -maxRotationPerTick.get().floatValue(), 
+                 maxRotationPerTick.get().floatValue());
+        }
+        
+        if (Math.abs(desiredChange) < 0.1f) return;
+        
+        float newYaw = currentYaw + desiredChange;
+        
+        mc.player.setYRot(newYaw);
+        mc.player.yBodyRot = newYaw;
+        mc.player.yHeadRot = newYaw;
+    }
+
+    private boolean isObstacleInWay(Vec3 targetPos) {
+        if (!pauseOnObstacle.get()) return false;
+        BlockHitResult hit = mc.level.clip(new ClipContext(
+            mc.player.getEyePosition(), targetPos, ClipContext.Block.COLLIDER, 
+            ClipContext.Fluid.NONE, mc.player
+        ));
+        return hit.getType() == HitResult.Type.BLOCK;
+    }
+
+    @EventHandler
+    private void onTick(TickEvent.Post event) {
+        if (mc.level == null || mc.player == null) return;
+
+        boolean targetExists = getTarget() != null;
+
+        if (role.get() == Role.Follower && safetyDisconnect.get() && !targetName.get().isEmpty()) {
+            
+            if (wasInWorld && !targetExists && followerState == FollowerState.TRACKING) {
+                lastKnownYaw = mc.player.getYRot(); 
+                followerState = FollowerState.PANIC_BOOST;
+                panicTimer = 3; 
+                waitTimerTicks = (int)(disconnectDelay.get() * 20.0); 
+                hasFiredPanicRocket = false;
+                warning("Target lost visual! Firing panic rocket...");
+            }
+
+            if (followerState == FollowerState.PANIC_BOOST) {
+                mc.player.setYRot(lastKnownYaw);
+                mc.player.yBodyRot = lastKnownYaw;
+                mc.player.yHeadRot = lastKnownYaw;
+                firePanicRocket();
+                panicTimer--;
+                if (panicTimer <= 0) followerState = FollowerState.WAITING;
+                return; 
+            }
+
+            if (followerState == FollowerState.WAITING) {
+                mc.player.setYRot(lastKnownYaw);
+                mc.player.yBodyRot = lastKnownYaw;
+                mc.player.yHeadRot = lastKnownYaw;
+
+                waitTimerTicks--;
+                
+                if (targetExists) {
+                    info("Target re-acquired! Resuming normal tracking.");
+                    resetFollowerPanicState();
+                } else if (waitTimerTicks <= 0) {
+                    error("Time ran out. Forcing safety disconnect...");
+                    forceDisconnect("[Handhold] Safety Disconnect: Lost " + targetName.get() + ".");
+                    return;
+                }
+                return; 
+            }
+        }
+        
+        if (safetyDisconnect.get() && !targetName.get().isEmpty()) {
+            if (wasInWorld && !targetExists && role.get() == Role.Leader) {
+                error("%s disconnected! Forcing safety disconnect...", targetName.get());
+                forceDisconnect("[Handhold] Safety Disconnect: " + targetName.get() + " left the server.");
+                return;
+            }
+        }
+        wasInWorld = targetExists;
+
+        if (!targetExists) {
+            if (!hasWarnedNotFound && !targetName.get().isEmpty()) {
+                warning("Waiting for %s...", targetName.get());
+                hasWarnedNotFound = true;
+            }
+            if (forcedRocketPilot) {
+                RocketPilot rp = Modules.get().get(RocketPilot.class);
+                if (rp != null && rp.isActive()) rp.toggle();
+                forcedRocketPilot = false;
+            }
+            return;
+        } else {
+            if (hasWarnedNotFound) {
+                info("Locked onto %s.", targetName.get());
+                hasWarnedNotFound = false;
+            }
+        }
+
+        if (role.get() == Role.Leader) {
+            if (!enablePaceControl.get() || !mc.player.isFallFlying()) {
+                if (leaderState == LeaderState.SLOWING_DOWN) restoreRocketPilot();
+                leaderState = LeaderState.NORMAL;
+                return;
+            }
+
+            Player follower = getTarget();
+            double dx = mc.player.getX() - follower.getX();
+            double dz = mc.player.getZ() - follower.getZ();
+            double horizontalDist = Math.sqrt(dx * dx + dz * dz);
+
+            if (leaderState == LeaderState.NORMAL) {
+                if (horizontalDist > maxLeadDistance.get()) {
+                    leaderState = LeaderState.SLOWING_DOWN;
+                    overrideRocketPilot();
+                    info("Follower falling behind. Slowing down...");
+                }
+            } else if (leaderState == LeaderState.SLOWING_DOWN) {
+                if (horizontalDist < resumeDistance.get()) {
+                    leaderState = LeaderState.NORMAL;
+                    restoreRocketPilot();
+                    info("Follower caught up. Resuming normal flight.");
+                } else {
+                    mc.player.setXRot(slowdownPitch.get().floatValue());
+                    mc.player.yBodyRot = mc.player.getYRot();
+                    mc.player.yHeadRot = mc.player.getYRot();
+                }
+            }
+            return; 
+        }
+
+        Player target = getTarget(); 
+        boolean targetFlying = isFallFlying(target);
+
+        if (lookAtTarget.get()) {
+            if (obstaclePauseTimer > 0) {
+                obstaclePauseTimer--;
+            } else {
+                Vec3 lookPos = targetFlying ? 
+                    com.example.addon.utils.MinecraftCompat.position(target).add(target.getDeltaMovement().scale(5)) : 
+                    com.example.addon.utils.MinecraftCompat.position(target);
+                    
+                if (mc.player.isFallFlying() && isObstacleInWay(lookPos)) {
+                    obstaclePauseTimer = obstaclePauseTicks.get();
+                } else {
+                    lookAtSmooth(lookPos);
+                }
+            }
+        }
+
+        if (targetFlying) {
+            RocketPilot rp = Modules.get().get(RocketPilot.class);
+            if (rp != null) {
+                if (!rp.flightPattern.get().equals(RocketPilot.FlightPattern.Manual)) {
+                    rp.flightPattern.set(RocketPilot.FlightPattern.Manual);
+                    info("Rocket Pilot pattern set to Manual for Handhold.");
+                }
+
+                if (!rp.isActive()) {
+                    rp.toggle();
+                    forcedRocketPilot = true;
+                    info("Target started flying, enabled Rocket Pilot.");
+                }
+            }
+        } else {
+            if (wasTargetFlying) {
+                if (disableWhenTargetLands.get()) {
+                    if (forcedRocketPilot) {
+                        RocketPilot rp = Modules.get().get(RocketPilot.class);
+                        if (rp != null && rp.isActive()) rp.toggle();
+                        forcedRocketPilot = false;
+                    }
+                    info("Target landed, disabling Handhold.");
+                    this.toggle();
+                    return;
+                } else {
+                    if (forcedRocketPilot) {
+                        RocketPilot rp = Modules.get().get(RocketPilot.class);
+                        if (rp != null && rp.isActive()) rp.toggle();
+                        forcedRocketPilot = false;
+                        info("Target landed, disabled Rocket Pilot.");
+                    }
+                }
+            }
+        }
+
+        wasTargetFlying = targetFlying;
+    }
+
+    @Override
+    public String getInfoString() {
+        if (role.get() == Role.Leader) {
+            if (leaderState == LeaderState.SLOWING_DOWN) return "Slowing Down ⏳";
+            return "Leading: " + (targetName.get().isEmpty() ? "None" : targetName.get());
+        }
+        
+        if (followerState == FollowerState.PANIC_BOOST) return "Panic Boost!";
+        if (followerState == FollowerState.WAITING) {
+            float remainingSecs = waitTimerTicks / 20.0f;
+            return String.format("DC in %.1fs", remainingSecs);
+        }
+
+        Player target = getTarget();
+        if (target == null) return "Searching...";
+        return target.getName().getString() + (isFallFlying(target) ? " ✈" : " 👁");
+    }
+}

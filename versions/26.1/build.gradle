@@ -1,0 +1,53 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17-SNAPSHOT'
+}
+
+def rootProperties = new Properties()
+file('../../gradle.properties').withInputStream { rootProperties.load(it) }
+version = "${rootProperties.getProperty('mod_version')}+mc26.1"
+group = rootProperties.getProperty('maven_group')
+base.archivesName = rootProperties.getProperty('archives_base_name')
+
+repositories {
+    maven { url = 'https://maven.meteordev.org/releases' }
+    maven { url = 'https://maven.meteordev.org/snapshots' }
+    maven { url = 'https://api.modrinth.com/maven' }
+    mavenCentral()
+}
+
+sourceSets.main.java.srcDir 'src/version/java'
+
+dependencies {
+    minecraft 'com.mojang:minecraft:26.1'
+    implementation 'net.fabricmc:fabric-loader:0.19.2'
+    implementation 'meteordevelopment:meteor-client:26.1.2-SNAPSHOT'
+    implementation files('libs/baritone-api-fabric-1.18.0.jar')
+    compileOnly 'maven.modrinth:xaeros-world-map:fabric-26.1.2-1.47.2'
+    compileOnly 'maven.modrinth:xaeroplus:2.37.2+fabric-26.1.2'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+}
+
+processResources {
+    inputs.property 'version', project.version
+    from('../../src/main/resources') {
+        include 'assets/**'
+    }
+    filesMatching('fabric.mod.json') {
+        expand(version: project.version, mc_version: '26.1')
+    }
+}
+
+jar {
+    from('../../LICENSE') {
+        rename { "${it}_${base.archivesName.get()}" }
+    }
+}
