@@ -199,7 +199,8 @@ public class Illumood extends Module {
     }
 
     public static Illumood get() {
-        return Modules.get().get(Illumood.class);
+        Modules modules = Modules.get();
+        return modules == null ? null : modules.get(Illumood.class);
     }
 
     @Override

@@ -41,6 +41,9 @@ sourceSets {
         if (mcVersion == "1.21.5" || mcVersion == "1.21.8") {
             java.srcDir("src/v1_21_5_plus/java")
         }
+        if (mcVersion != "1.21.11") {
+            java.srcDir("src/v1_21_legacy/java")
+        }
     }
 }
 
@@ -80,7 +83,7 @@ dependencies {
     annotationProcessor("net.fabricmc:sponge-mixin:0.16.5+mixin.0.8.7")
 
     // Meteor Client
-    modImplementation(libs.meteor.client)
+    modImplementation("meteordevelopment:meteor-client:$mcVersion-SNAPSHOT")
 
     // Baritone API
     modImplementation(files("libs/baritone-api-fabric-1.13.1.jar"))

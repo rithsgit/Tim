@@ -1,6 +1,7 @@
 package com.example.addon.render;
 
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.renderer.Renderer2D;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 
 public final class RenderCompat {
@@ -37,5 +38,9 @@ public final class RenderCompat {
     }
 
     public static void endSignOverlay() {
+    }
+
+    public static void renderColor() {
+        Renderer2D.COLOR.render();
     }
 }

@@ -2,6 +2,7 @@ package com.example.addon.render;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.renderer.Renderer2D;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import net.minecraft.client.gl.ShaderProgramKeys;
 import net.minecraft.client.render.BufferBuilder;
@@ -87,5 +88,9 @@ public final class RenderCompat {
     public static void endSignOverlay() {
         RenderSystem.depthMask(true);
         RenderSystem.enableDepthTest();
+    }
+
+    public static void renderColor() {
+        Renderer2D.COLOR.render(null);
     }
 }

@@ -30,6 +30,7 @@ import com.example.addon.Tim;
 import com.example.addon.gui.WaypearlMessengerScreen;
 import com.example.addon.utils.GlowingRegistry;
 import com.example.addon.utils.Hotbar;
+import com.example.addon.utils.MeteorCompat;
 import com.example.addon.utils.WaypearlArmedPullPolicy;
 import com.example.addon.utils.WaypearlFollowupPolicy;
 import com.example.addon.utils.WaypearlDropRotation;
@@ -47,7 +48,6 @@ import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
 import meteordevelopment.meteorclient.events.meteor.KeyEvent;
-import meteordevelopment.meteorclient.events.meteor.MouseButtonEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.gui.GuiThemes;
@@ -62,7 +62,6 @@ import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.StringListSetting;
 import meteordevelopment.meteorclient.settings.StringSetting;
-import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
 import meteordevelopment.meteorclient.utils.misc.input.KeyAction;
@@ -104,7 +103,7 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 
-public class Waypearl extends Module {
+public class Waypearl extends MouseAwareModule {
 
     // ═══════════════════════════════════════════════════════════════
     // Enums
@@ -720,19 +719,21 @@ public class Waypearl extends Module {
     @EventHandler
     private void onMenuKey(KeyEvent event) {
         if (mc.world == null && mc.currentScreen instanceof TitleScreen && messengerAvailable()
-            && event.action == KeyAction.Press && messengerOpenKey.get().matches(true, event.key, event.modifiers)) {
+            && event.action == KeyAction.Press
+            && messengerOpenKey.get().matches(true, MeteorCompat.key(event), MeteorCompat.modifiers(event))) {
             mc.setScreen(new WaypearlMessengerScreen(GuiThemes.get(), this));
             event.cancel();
         }
     }
 
-    @EventHandler
-    private void onMenuMouse(MouseButtonEvent event) {
+    @Override
+    protected boolean onMouseButton(int button, KeyAction action) {
         if (mc.world == null && mc.currentScreen instanceof TitleScreen && messengerAvailable()
-            && event.action == KeyAction.Press && messengerOpenKey.get().matches(false, event.button, 0)) {
+            && action == KeyAction.Press && messengerOpenKey.get().matches(false, button, 0)) {
             mc.setScreen(new WaypearlMessengerScreen(GuiThemes.get(), this));
-            event.cancel();
+            return true;
         }
+        return false;
     }
 
     @EventHandler

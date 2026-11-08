@@ -645,7 +645,7 @@ public class SignScanner extends Module {
             }
             Renderer2D.COLOR.begin();
             Renderer2D.COLOR.quad(bx, by, bw, bh, backgroundColor.get());
-            Renderer2D.COLOR.render(null);
+            RenderCompat.renderColor();
         }
 
         tr.begin(1.0, false, true);
@@ -694,7 +694,7 @@ public class SignScanner extends Module {
                 withAlpha(gc, layerAlpha)
             );
         }
-        Renderer2D.COLOR.render(null);
+        RenderCompat.renderColor();
     }
 
     private float getPulseFactor() {
@@ -730,7 +730,7 @@ public class SignScanner extends Module {
                 withAlpha(pColor, layerAlpha)
             );
         }
-        Renderer2D.COLOR.render(null);
+        RenderCompat.renderColor();
     }
 
     private void renderSpectralHighlight(double bx, double by, double bw, double bh) {
@@ -763,7 +763,7 @@ public class SignScanner extends Module {
         Renderer2D.COLOR.quad(ox,                oy + thickness,      thickness, oh - thickness * 2, lc); 
         Renderer2D.COLOR.quad(ox + ow - thickness, oy + thickness,    thickness, oh - thickness * 2, lc); 
 
-        Renderer2D.COLOR.render(null);
+        RenderCompat.renderColor();
     }
 
     private SettingColor withAlpha(SettingColor color, int alpha) {

@@ -7,6 +7,7 @@ import com.example.addon.mixin.RecipeBookWidgetAccessor;
 import com.example.addon.mixin.SettingTitleAccessor;
 import com.example.addon.utils.AttackGuardPolicy;
 import com.example.addon.utils.ElytraTakeoffSequence;
+import com.example.addon.utils.MeteorCompat;
 import com.example.addon.utils.EnderChestWaterRecovery;
 import com.example.addon.utils.OceanBreachAscent;
 import com.example.addon.utils.OceanBreachSequence;
@@ -21,9 +22,7 @@ import com.example.addon.utils.SettingNameCompat;
 import meteordevelopment.meteorclient.events.entity.player.AttackEntityEvent;
 import meteordevelopment.meteorclient.events.entity.player.PlayerTickMovementEvent;
 import meteordevelopment.meteorclient.events.meteor.KeyEvent;
-import meteordevelopment.meteorclient.events.meteor.MouseButtonEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
-import meteordevelopment.meteorclient.mixin.KeyBindingAccessor;
 import meteordevelopment.meteorclient.pathing.BaritoneUtils;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.DoubleSetting;
@@ -86,7 +85,7 @@ import java.util.Set;
 import java.util.List;
 import java.util.Random;
 
-public class Tweaker extends Module {
+public class Tweaker extends MouseAwareModule {
     public enum AttackGuardMode {
         SelectedTypes,
         AllMobs
@@ -489,16 +488,17 @@ public class Tweaker extends Module {
 
     @EventHandler
     private void onAirPlaceKeyRelease(KeyEvent event) {
-        InputUtil.Key key = ((KeyBindingAccessor) mc.options.useKey).getKey();
-        if (event.action == KeyAction.Release && key.getCategory() == InputUtil.Type.KEYSYM && key.getCode() == event.key)
+        InputUtil.Key key = MeteorCompat.boundKey(mc.options.useKey);
+        if (event.action == KeyAction.Release && key.getCategory() == InputUtil.Type.KEYSYM && key.getCode() == MeteorCompat.key(event))
             airPlaceConsumed = false;
     }
 
-    @EventHandler
-    private void onAirPlaceMouseRelease(MouseButtonEvent event) {
-        InputUtil.Key key = ((KeyBindingAccessor) mc.options.useKey).getKey();
-        if (event.action == KeyAction.Release && key.getCategory() == InputUtil.Type.MOUSE && key.getCode() == event.button)
+    @Override
+    protected boolean onMouseButton(int button, KeyAction action) {
+        InputUtil.Key key = MeteorCompat.boundKey(mc.options.useKey);
+        if (action == KeyAction.Release && key.getCategory() == InputUtil.Type.MOUSE && key.getCode() == button)
             airPlaceConsumed = false;
+        return false;
     }
 
     @EventHandler(priority = EventPriority.HIGH)
@@ -1975,7 +1975,7 @@ public class Tweaker extends Module {
     }
 
     private boolean isPhysicallyPressed(KeyBinding binding) {
-        InputUtil.Key key = ((KeyBindingAccessor) binding).getKey();
+        InputUtil.Key key = MeteorCompat.boundKey(binding);
         long window = mc.getWindow().getHandle();
         if (key.getCategory() == InputUtil.Type.KEYSYM && key.getCode() != GLFW.GLFW_KEY_UNKNOWN)
             return GLFW.glfwGetKey(window, key.getCode()) == GLFW.GLFW_PRESS;

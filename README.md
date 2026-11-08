@@ -431,6 +431,8 @@ More modules and HUDs are planned.
 ## Building from Source
 
 This project uses Gradle and supports building a separate addon JAR for each supported Minecraft version.
+Each target compiles against the corresponding Meteor Client snapshot, so use a
+matching Meteor version at runtime.
 
 ### Setup
 
