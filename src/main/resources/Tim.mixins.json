@@ -28,11 +28,22 @@
     "IMouseAccessor",
     "InactivityFpsLimiterMixin",
     "InGameHudMixin",
+    "IllumoodEnvironmentMixin",
+    "IllumoodLightmapMixin",
+    "IllumoodTerrainObfuscatorMixin",
+    "LightmapTextureManagerAccessor",
+    "BookEditScreenAccessor",
     "LivingEntityRendererMixin",
     "MixinSignBlockEntityRenderer",
     "PlayerEntityRendererMixin",
+    "RecipeBookWidgetAccessor",
+    "SettingTitleAccessor",
     "ThirdSightCameraMixin",
-    "TunnelersMixin"
+    "TunnelersMixin",
+    "TweakerGhostHandsMixin",
+    "TweakerPortalMixin",
+    "TweakerSafeWalkMixin",
+    "TweakerSafeWalkInputMixin"
   ],
   "injectors": {
     "defaultRequire": 1

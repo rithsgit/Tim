@@ -38,8 +38,10 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Box;
+import net.minecraft.world.World;
 
 public class Mobanom extends Module {
 
@@ -51,6 +53,7 @@ public class Mobanom extends Module {
         DIMENSION_NETHER,
         DIMENSION_END,
         DIMENSION_OVERWORLD,
+        ENDERMITE,
         ITEM,
         CHESTED
     }
@@ -103,6 +106,21 @@ public class Mobanom extends Module {
         .name("range")
         .description("The range to detect anomalies.")
         .defaultValue(128).min(1).sliderMax(256)
+        .build()
+    );
+
+    private final Setting<Boolean> trackEndermites = sgGeneral.add(new BoolSetting.Builder()
+        .name("track-endermites")
+        .description("Track Overworld endermites with a dedicated color, beam, and detection sound.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> endermiteBeam = sgGeneral.add(new BoolSetting.Builder()
+        .name("endermite-beam")
+        .description("Draw a vertical beam through tracked endermites.")
+        .defaultValue(true)
+        .visible(trackEndermites::get)
         .build()
     );
 
@@ -178,6 +196,14 @@ public class Mobanom extends Module {
         .name("end-line-color")
         .description("Glow color for End mobs found in other dimensions.")
         .defaultValue(new SettingColor(255, 0, 255, 255))
+        .build()
+    );
+
+    private final Setting<SettingColor> endermiteColor = sgColors.add(new ColorSetting.Builder()
+        .name("endermite-color")
+        .description("Highlight and beam color for tracked endermites.")
+        .defaultValue(new SettingColor(138, 43, 226, 255))
+        .visible(trackEndermites::get)
         .build()
     );
 
@@ -297,6 +323,8 @@ public class Mobanom extends Module {
 
     private final Map<Integer, AnomalyType> highlightedEntities = new HashMap<>();
     private final Set<Integer>              notifiedEntities    = new HashSet<>();
+    private final Set<Integer>              notifiedEndermites  = new HashSet<>();
+    private net.minecraft.client.world.ClientWorld trackedWorld;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Constructor & Lifecycle
@@ -310,6 +338,8 @@ public class Mobanom extends Module {
     public void onActivate() {
         highlightedEntities.clear();
         notifiedEntities.clear();
+        notifiedEndermites.clear();
+        trackedWorld = null;
         GlowingRegistry.clear();
     }
 
@@ -317,6 +347,8 @@ public class Mobanom extends Module {
     public void onDeactivate() {
         highlightedEntities.clear();
         notifiedEntities.clear();
+        notifiedEndermites.clear();
+        trackedWorld = null;
         GlowingRegistry.clear();
     }
 
@@ -326,11 +358,23 @@ public class Mobanom extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
-        if (mc.world == null || mc.player == null) return;
+        if (mc.world == null || mc.player == null) {
+            highlightedEntities.clear();
+            notifiedEntities.clear();
+            notifiedEndermites.clear();
+            trackedWorld = null;
+            return;
+        }
+        if (trackedWorld != mc.world) {
+            notifiedEntities.clear();
+            notifiedEndermites.clear();
+            trackedWorld = mc.world;
+        }
 
         highlightedEntities.clear();
         GlowingRegistry.clear();
         notifiedEntities.removeIf(id -> mc.world.getEntityById(id) == null);
+        Set<Integer> currentEndermites = new HashSet<>();
 
         String dim = mc.world.getRegistryKey().getValue().toString();
         boolean spectral = highlightMode.get() == HighlightMode.Spectral;
@@ -340,17 +384,26 @@ public class Mobanom extends Module {
             if (ignoredEntities.get().contains(mob.getType())) continue;
             if (mc.player.distanceTo(mob) > range.get()) continue;
 
-            AnomalyType type = resolveAnomalyType(mob, dim);
+            boolean trackedEndermite = trackEndermites.get() && mc.world.getRegistryKey().equals(World.OVERWORLD)
+                && mob.getType() == EntityType.ENDERMITE && mob.isAlive();
+            AnomalyType type = trackedEndermite ? AnomalyType.ENDERMITE : resolveAnomalyType(mob, dim);
             if (type == null) continue;
 
             highlightedEntities.put(mob.getId(), type);
+            if (trackedEndermite) {
+                currentEndermites.add(mob.getId());
+                if (notifiedEndermites.add(mob.getId())) {
+                    if (chatNotification.get()) info("Endermite detected.");
+                    mc.player.playSound(SoundEvents.ENTITY_ENDERMITE_AMBIENT, 1.0f, 1.0f);
+                }
+            }
 
             if (spectral) {
                 SettingColor c = getColorForType(type);
                 GlowingRegistry.add(mob.getId(), (255 << 24) | (c.r << 16) | (c.g << 8) | c.b);
             }
 
-            if (chatNotification.get() && notifiedEntities.add(mob.getId())) {
+            if (!trackedEndermite && chatNotification.get() && notifiedEntities.add(mob.getId())) {
                 String mobName = mob.getType().getName().getString();
                 switch (type) {
                     case CHESTED -> info("Chested animal detected: "    + mobName);
@@ -359,6 +412,7 @@ public class Mobanom extends Module {
                 }
             }
         }
+        notifiedEndermites.retainAll(currentEndermites);
     }
 
     @EventHandler
@@ -373,6 +427,15 @@ public class Mobanom extends Module {
             if (!(entity instanceof MobEntity mob)) continue;
 
             SettingColor color = getColorForType(entry.getValue());
+            if (entry.getValue() == AnomalyType.ENDERMITE && endermiteBeam.get()) {
+                Box box = mob.getBoundingBox();
+                double x = (box.minX + box.maxX) / 2.0;
+                double z = (box.minZ + box.maxZ) / 2.0;
+                int bottom = mc.world.getBottomY();
+                event.renderer.box(new Box(x - 0.15, bottom, z - 0.15,
+                    x + 0.15, bottom + mc.world.getHeight(), z + 0.15),
+                    withAlpha(color, 80), color, ShapeMode.Both, 0);
+            }
 
             if (wireframe) {
                 renderGlowLayers(event, mob.getBoundingBox(), color);
@@ -501,6 +564,7 @@ public class Mobanom extends Module {
     private SettingColor getColorForType(AnomalyType type) {
         return switch (type) {
             case ITEM, CHESTED       -> itemAnomalyLineColor.get();
+            case ENDERMITE           -> endermiteColor.get();
             case DIMENSION_END       -> endLineColor.get();
             case DIMENSION_NETHER    -> netherLineColor.get();
             case DIMENSION_OVERWORLD -> overworldLineColor.get();

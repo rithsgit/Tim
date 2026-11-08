@@ -19,7 +19,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +27,16 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.example.addon.Tim;
+import com.example.addon.gui.WaypearlMessengerScreen;
 import com.example.addon.utils.GlowingRegistry;
+import com.example.addon.utils.Hotbar;
+import com.example.addon.utils.WaypearlArmedPullPolicy;
+import com.example.addon.utils.WaypearlFollowupPolicy;
+import com.example.addon.utils.WaypearlDropRotation;
+import com.example.addon.utils.WaypearlInteractionHand;
+import com.example.addon.utils.WaypearlLocalMessenger;
+import com.example.addon.utils.WaypearlMessengerMessages;
+import com.example.addon.utils.WaypearlPathfinder;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
@@ -36,9 +44,13 @@ import com.google.gson.JsonParseException;
 import net.fabricmc.loader.api.FabricLoader;
 import meteordevelopment.meteorclient.events.entity.EntityAddedEvent;
 import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
+import meteordevelopment.meteorclient.events.game.GameLeftEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
+import meteordevelopment.meteorclient.events.meteor.KeyEvent;
+import meteordevelopment.meteorclient.events.meteor.MouseButtonEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.gui.GuiThemes;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.ColorSetting;
@@ -53,6 +65,7 @@ import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.misc.input.KeyAction;
 import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
@@ -61,6 +74,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.TrapdoorBlock;
 import net.minecraft.client.network.PlayerListEntry;
+import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.render.VertexConsumerProvider;
 import net.minecraft.client.render.block.entity.BeaconBlockEntityRenderer;
@@ -70,7 +84,10 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.projectile.thrown.EnderPearlEntity;
+import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.slot.Slot;
+import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
@@ -140,6 +157,7 @@ public class Waypearl extends Module {
     private final SettingGroup sgCap        = settings.createGroup("Cap Box");
     private final SettingGroup sgSound      = settings.createGroup("Sound");
     private final SettingGroup sgBot        = settings.createGroup("Bot Assistant");
+    private final SettingGroup sgMessenger  = settings.createGroup("Messenger");
     private final SettingGroup sgWalker     = settings.createGroup("Walker");
     private final SettingGroup sgPearlsOnly = settings.createGroup("Pearls Only");
     private final SettingGroup sgDisconnect = settings.createGroup("Auto Disconnect");
@@ -283,6 +301,37 @@ public class Waypearl extends Module {
         .name("notify-message").defaultValue("Pulling your pearl now, {player}.")
         .visible(() -> moduleMode.get() == ModuleMode.Assistant && notifyEnabled.get()).build());
 
+    private final Setting<Boolean> messengerEnabled = sgMessenger.add(new BoolSetting.Builder()
+        .name("messenger-enabled").description("Enables the local encrypted messenger.")
+        .defaultValue(false).build());
+    private final Setting<Boolean> messengerAutoPull = sgMessenger.add(new BoolSetting.Builder()
+        .name("auto-pull").description("Automatically process direct requests from whitelisted players.")
+        .defaultValue(true).visible(() -> messengerEnabled.get() && moduleMode.get() == ModuleMode.Assistant).build());
+    private final Setting<Keybind> messengerOpenKey = sgMessenger.add(new KeybindSetting.Builder()
+        .name("open-messenger-key").defaultValue(Keybind.none()).visible(messengerEnabled::get).build());
+    private final Setting<Keybind> messengerPullKey = sgMessenger.add(new KeybindSetting.Builder()
+        .name("messenger-pull-key").defaultValue(Keybind.none())
+        .visible(() -> messengerEnabled.get() && moduleMode.get() == ModuleMode.Requester).build());
+    private final Setting<String> messengerQuickMessage = sgMessenger.add(new StringSetting.Builder()
+        .name("quick-message").description("Custom message used by the quick-message hotkey.")
+        .defaultValue("pull please").visible(messengerEnabled::get).build());
+    private final Setting<Keybind> messengerQuickKey = sgMessenger.add(new KeybindSetting.Builder()
+        .name("quick-message-key").defaultValue(Keybind.none()).visible(messengerEnabled::get).build());
+    private final Setting<List<String>> messengerPresets = sgMessenger.add(new StringListSetting.Builder()
+        .name("message-presets").description("Custom messages displayed as buttons in the messenger.")
+        .defaultValue(List.of("pull please", "Thank you!")).visible(messengerEnabled::get).build());
+
+    private final Setting<Boolean> replacePearl = sgBot.add(new BoolSetting.Builder()
+        .name("drop-replacement-pearl").description("Drop one pearl for the requester after a confirmed pull.")
+        .defaultValue(true).visible(() -> moduleMode.get() == ModuleMode.Assistant).build());
+    private final Setting<Boolean> pearlReminder = sgBot.add(new BoolSetting.Builder()
+        .name("replacement-reminder").description("Remind a requester when no new owned stasis pearl is detected.")
+        .defaultValue(true).visible(() -> moduleMode.get() == ModuleMode.Assistant).build());
+    private final Setting<Integer> pearlReminderDelay = sgBot.add(new IntSetting.Builder()
+        .name("reminder-delay-seconds").description("Seconds to wait after a confirmed pull before reminding.")
+        .defaultValue(120).min(10).sliderMax(600)
+        .visible(() -> moduleMode.get() == ModuleMode.Assistant && pearlReminder.get()).build());
+
     // ═══════════════════════════════════════════════════════════════
     // Settings — Walker
     // ═══════════════════════════════════════════════════════════════
@@ -300,7 +349,8 @@ public class Waypearl extends Module {
         .visible(() -> moduleMode.get() == ModuleMode.Assistant && walkerEnabled.get()).build());
 
     private final Setting<Double> waypointSpacing = sgWalker.add(new DoubleSetting.Builder()
-        .name("waypoint-spacing").defaultValue(6.0).min(2.0).sliderMax(20.0)
+        .name("waypoint-spacing").description("Controls waypoint arrival tolerance without skipping path corners.")
+        .defaultValue(6.0).min(2.0).sliderMax(20.0)
         .visible(() -> moduleMode.get() == ModuleMode.Assistant && walkerEnabled.get()).build());
 
     private final Setting<Integer> walkTimeoutTicks = sgWalker.add(new IntSetting.Builder()
@@ -346,10 +396,6 @@ public class Waypearl extends Module {
     private final Setting<Integer> jumpCooldownTicks = sgWalker.add(new IntSetting.Builder()
         .name("jump-cooldown").defaultValue(12).min(4).sliderMax(40)
         .visible(() -> moduleMode.get() == ModuleMode.Assistant && walkerEnabled.get() && walkerJump.get()).build());
-
-    private final Setting<Boolean> sneakOnInteract = sgWalker.add(new BoolSetting.Builder()
-        .name("sneak-on-interact").defaultValue(true)
-        .visible(() -> moduleMode.get() == ModuleMode.Assistant && walkerEnabled.get()).build());
 
     private final Setting<Boolean> abortOnLowHealth = sgWalker.add(new BoolSetting.Builder()
         .name("abort-on-low-health").defaultValue(true)
@@ -487,6 +533,30 @@ public class Waypearl extends Module {
     private record PearlRecord(int entityId, UUID uuid, String server, String dimension, String owner,
                                BlockPos pearlPos, BlockPos trapdoor, long discoveredMs) {}
 
+    private static final class PullFollowup {
+        final PearlRecord pearl;
+        final String requester;
+        final boolean direct;
+        final Set<UUID> existingPearls;
+        boolean interactionSent;
+        boolean dropPending;
+        final WaypearlDropRotation dropRotation = new WaypearlDropRotation();
+        boolean reminderPending;
+        long confirmationDeadline;
+        long dropDeadline;
+        long reminderDeadline;
+
+        PullFollowup(PearlRecord pearl, String requester, boolean direct, Set<UUID> existingPearls) {
+            this.pearl = pearl;
+            this.requester = requester;
+            this.direct = direct;
+            this.existingPearls = existingPearls;
+        }
+    }
+
+    private record FollowupMessage(String server, String requester, String text) {}
+    private record ArmedPull(String requester, String server, String dimension, long connectionId) {}
+
     private static final class PearlCache {
         int version = 1;
         List<PearlCacheEntry> pearls = new ArrayList<>();
@@ -521,11 +591,27 @@ public class Waypearl extends Module {
     private final AtomicLong    lastTriggerMs = new AtomicLong(0L);
 
     private volatile String pendingNotifyTarget = null;
+    private boolean pendingStrictOwner;
+    private ArmedPull armedPull;
+    private PullFollowup activePull;
+    private final List<PullFollowup> followups = new ArrayList<>();
+    private final Deque<FollowupMessage> followupMessages = new ArrayDeque<>();
+    private long lastFollowupMessageMs;
+    private final Deque<String> messengerHistory = new ArrayDeque<>();
+    private WaypearlLocalMessenger messengerTransport;
+    private ModuleMode messengerTransportMode;
+    private volatile Set<String> messengerAllowed = Set.of();
+    private String messengerStatus = "Disconnected";
+    private boolean wasMessengerOpenPressed, wasMessengerPullPressed, wasMessengerQuickPressed;
     private boolean wasSelfTriggerPressed = false;
     private int tickCounter = 0;
 
     private WalkState          walkState    = WalkState.IDLE;
     private BlockPos           walkTarget   = null;
+    private World              walkWorld;
+    private UUID               walkPearlId;
+    private boolean            walkInteractionPending;
+    private long               walkGeneration;
     private Vec3d              idlePosition = null;
     private final Deque<Vec3d> waypoints    = new ArrayDeque<>();
     private int                walkTicks    = 0;
@@ -544,6 +630,7 @@ public class Waypearl extends Module {
 
     public Waypearl() {
         super(Tim.CATEGORY, "Waypearl", "Detects nearby stasis pearls sitting above bubble columns.");
+        runInMainMenu = true;
     }
 
     public int getRange() { return range.get(); }
@@ -555,6 +642,11 @@ public class Waypearl extends Module {
 
     @Override
     public void onActivate() {
+        armedPull = null;
+        activePull = null;
+        followups.clear();
+        followupMessages.clear();
+        lastFollowupMessageMs = 0;
         columnLines.set(Collections.emptyMap());
         loadPearlCache();
         seenPearlIds.clear();
@@ -562,6 +654,9 @@ public class Waypearl extends Module {
         pullQueued.set(false);
         scanPending.set(false);
         pendingNotifyTarget = null;
+        pendingStrictOwner = false;
+        synchronized (messengerHistory) { messengerHistory.clear(); }
+        wasMessengerOpenPressed = wasMessengerPullPressed = wasMessengerQuickPressed = false;
         tickCounter = 0;
         resetWalker();
         wasSelfTriggerPressed = false;
@@ -576,6 +671,10 @@ public class Waypearl extends Module {
 
     @Override
     public void onDeactivate() {
+        activePull = null;
+        followups.clear();
+        followupMessages.clear();
+        stopMessenger();
         columnLines.set(Collections.emptyMap());
         pingQueued.set(false);
         pullQueued.set(false);
@@ -593,14 +692,53 @@ public class Waypearl extends Module {
 
     @EventHandler
     private void onGameJoined(GameJoinedEvent event) {
+        activePull = null;
+        followups.clear();
+        followupMessages.clear();
+        if (!messengerRequester()) stopMessenger();
         disconnectArmed = true;
         lastDisconnectMsgMs = 0L;
+        if (!messengerRequester()) synchronized (messengerHistory) { messengerHistory.clear(); }
+    }
+
+    @EventHandler
+    private void onGameLeft(GameLeftEvent event) {
+        activePull = null;
+        followups.clear();
+        followupMessages.clear();
+        pullQueued.set(false);
+        pendingNotifyTarget = null;
+        pendingStrictOwner = false;
+        columnLines.set(Collections.emptyMap());
+        seenPearlIds.clear();
+        pingQueued.set(false);
+        stopMovement();
+        resetWalker();
+        if (!messengerRequester()) stopMessenger();
+    }
+
+    @EventHandler
+    private void onMenuKey(KeyEvent event) {
+        if (mc.world == null && mc.currentScreen instanceof TitleScreen && messengerAvailable()
+            && event.action == KeyAction.Press && messengerOpenKey.get().matches(true, event.key, event.modifiers)) {
+            mc.setScreen(new WaypearlMessengerScreen(GuiThemes.get(), this));
+            event.cancel();
+        }
+    }
+
+    @EventHandler
+    private void onMenuMouse(MouseButtonEvent event) {
+        if (mc.world == null && mc.currentScreen instanceof TitleScreen && messengerAvailable()
+            && event.action == KeyAction.Press && messengerOpenKey.get().matches(false, event.button, 0)) {
+            mc.setScreen(new WaypearlMessengerScreen(GuiThemes.get(), this));
+            event.cancel();
+        }
     }
 
     @EventHandler
     private void onReceiveMessage(ReceiveMessageEvent event) {
-        if (moduleMode.get() != ModuleMode.Assistant) return;
         String raw = event.getMessage().getString().trim();
+        if (moduleMode.get() != ModuleMode.Assistant) return;
 
         if (raw.startsWith("<")) {
             int closeAngle = raw.indexOf('>');
@@ -609,30 +747,273 @@ public class Waypearl extends Module {
                 return;
             }
         }
-
         if (raw.startsWith("[") && raw.contains("->") && raw.contains("]:")) {
-            int arrowIdx   = raw.indexOf("->");
+            int arrowIdx = raw.indexOf("->");
             int bracketEnd = raw.indexOf("]:");
             if (arrowIdx > 1 && bracketEnd > arrowIdx) {
-                evaluateTrigger(raw.substring(1, arrowIdx).trim(),
-                                raw.substring(bracketEnd + 2).trim(), true);
+                evaluateTrigger(raw.substring(1, arrowIdx).trim(), raw.substring(bracketEnd + 2).trim(), true);
                 return;
             }
         }
-
         String tag3 = " whispers to you: ";
         int idx3 = raw.indexOf(tag3);
         if (idx3 > 0) {
-            evaluateTrigger(raw.substring(0, idx3).trim(),
-                            raw.substring(idx3 + tag3.length()).trim(), true);
+            evaluateTrigger(raw.substring(0, idx3).trim(), raw.substring(idx3 + tag3.length()).trim(), true);
             return;
         }
-
         String tag4 = " whispers: ";
         int idx4 = raw.indexOf(tag4);
         if (idx4 > 0) {
-            evaluateTrigger(raw.substring(0, idx4).trim(),
-                            raw.substring(idx4 + tag4.length()).trim(), true);
+            evaluateTrigger(raw.substring(0, idx4).trim(), raw.substring(idx4 + tag4.length()).trim(), true);
+        }
+    }
+
+    private void receiveMessenger(String sender, WaypearlLocalMessenger.MessageType type, String message) {
+        if (!messengerAvailable()) return;
+        if (!messengerRequester() && (mc.world == null || mc.player == null)) return;
+        if (moduleMode.get() == ModuleMode.Assistant && !isMessengerPeerAllowed(sender)) return;
+        recordMessenger((messengerRequester() ? "Assistant" : sender) + ": " + message);
+        if (messengerRequester() && mc.player != null) {
+            mc.player.sendMessage(Text.literal("[Waypearl Messenger] " + message), false);
+        }
+        if (messengerRequester()) return;
+        if (type == WaypearlLocalMessenger.MessageType.CANCEL) {
+            if (armedPull != null && armedPull.requester().equalsIgnoreCase(sender)) {
+                armedPull = null;
+                sendMessenger(sender, "Armed pull cancelled.");
+            } else sendMessenger(sender, "No armed pull to cancel.");
+            return;
+        }
+        if (type == WaypearlLocalMessenger.MessageType.ARM) {
+            armPull(sender);
+            return;
+        }
+        boolean pull = type == WaypearlLocalMessenger.MessageType.PULL;
+        if (moduleMode.get() == ModuleMode.Assistant && !messengerAutoPull.get()
+            && (pull || matchesTrigger(message))) {
+            sendMessenger(sender, "Pull unavailable: assistant auto-pull is disabled.");
+            return;
+        }
+        if (moduleMode.get() == ModuleMode.Assistant && messengerAutoPull.get()
+            && (pull || matchesTrigger(message))) {
+            if (mc.world == null || mc.world.getRegistryKey() == World.NETHER) {
+                warning("Messenger pull unavailable in the Nether.");
+                sendMessenger(sender, "Pull unavailable: assistant is in the Nether.");
+            } else if (!isPlayerOnline(sender)) {
+                sendMessenger(sender, "You are not online on this server. Use Arm Pull for Server Join instead.");
+            } else if (armedPull != null || pullQueued.get() || activePull != null || (walkState != WalkState.IDLE && walkState != WalkState.ABORTED)) {
+                warning("Messenger pull ignored: assistant is busy.");
+                sendMessenger(sender, "Pull unavailable: assistant is busy.");
+            } else {
+                pendingNotifyTarget = sender;
+                pendingStrictOwner = true;
+                pullQueued.set(true);
+            }
+        }
+    }
+
+    private void armPull(String sender) {
+        if (!messengerAutoPull.get()) {
+            sendMessenger(sender, "Cannot arm: assistant auto-pull is disabled.");
+        } else if (mc.world.getRegistryKey() == World.NETHER) {
+            sendMessenger(sender, "Cannot arm: assistant is in the Nether.");
+        } else if (isPlayerOnline(sender)) {
+            sendMessenger(sender, "Cannot arm: you are already online on the assistant's server. Use Request Pearl Pull instead.");
+        } else if (armedPull != null || pullQueued.get() || activePull != null
+            || (walkState != WalkState.IDLE && walkState != WalkState.ABORTED)) {
+            sendMessenger(sender, "Cannot arm: assistant is already busy or waiting.");
+        } else {
+            armedPull = new ArmedPull(sender, currentServerKey(), currentDimensionKey(), messengerTransport.connectionId());
+            sendMessenger(sender, WaypearlMessengerMessages.ARMED_CONFIRMATION);
+        }
+    }
+
+    private boolean matchesTrigger(String message) {
+        for (String phrase : triggerPhrase.get().split(",")) {
+            String keyword = phrase.trim();
+            String normalized = message.toLowerCase(Locale.ROOT);
+            String trigger = keyword.toLowerCase(Locale.ROOT);
+            if (!keyword.isEmpty() && (normalized.equals(trigger) || normalized.startsWith(trigger + " "))) return true;
+        }
+        return false;
+    }
+
+    private boolean isMessengerPeerAllowed(String peer) {
+        if (peer == null || !peer.matches("[A-Za-z0-9_]{1,16}")) return false;
+        if (moduleMode.get() == ModuleMode.Requester) return peer.equalsIgnoreCase(botUsername.get().trim());
+        return whitelist.get().stream().anyMatch(name -> name.equalsIgnoreCase(peer));
+    }
+
+    private void recordMessenger(String message) {
+        synchronized (messengerHistory) {
+            if (messengerHistory.size() >= 8) messengerHistory.removeFirst();
+            messengerHistory.addLast(message);
+        }
+        mc.execute(() -> {
+            if (mc.currentScreen instanceof WaypearlMessengerScreen screen) screen.refreshMessages();
+        });
+    }
+
+    public List<String> messengerMessages() {
+        synchronized (messengerHistory) {
+            return List.copyOf(messengerHistory);
+        }
+    }
+    public List<String> messengerPresets() { return List.copyOf(messengerPresets.get()); }
+    public String messengerPeer() {
+        if (messengerRequester()) return botUsername.get().trim();
+        return messengerTransport == null ? "" : messengerTransport.peer();
+    }
+    public boolean messengerAvailable() { return isActive() && messengerEnabled.get(); }
+    public boolean messengerRequester() { return moduleMode.get() == ModuleMode.Requester; }
+
+    public String messengerStatus() { return messengerStatus; }
+    public String messengerFingerprint() { return messengerTransport == null ? "" : messengerTransport.fingerprint(); }
+
+    private void refreshMessengerAllowed() {
+        Set<String> allowed = new HashSet<>();
+        for (String name : whitelist.get()) allowed.add(name.toLowerCase(Locale.ROOT));
+        messengerAllowed = Set.copyOf(allowed);
+    }
+
+    private WaypearlLocalMessenger createMessenger() {
+        final WaypearlLocalMessenger[] holder = new WaypearlLocalMessenger[1];
+        holder[0] = new WaypearlLocalMessenger(FabricLoader.getInstance().getConfigDir()
+            .resolve("tim").resolve("waypearl-messenger-credentials.json"), new WaypearlLocalMessenger.Listener() {
+            @Override public boolean allowed(String identity) {
+                return messengerAllowed.contains(identity.toLowerCase(Locale.ROOT));
+            }
+            @Override public void status(String message) {
+                mc.execute(() -> {
+                    if (message.startsWith("Failed to close")) warning("%s", message);
+                    if (messengerTransport != holder[0]) return;
+                    messengerStatus = message;
+                    if (message.startsWith("Host error:") || message.startsWith("Connection error:")
+                        || message.startsWith("Send error:") || message.startsWith("Requester authentication failed")) {
+                        warning("%s", message);
+                    }
+                    if (mc.currentScreen instanceof WaypearlMessengerScreen screen) screen.refreshMessages();
+                });
+            }
+            @Override public void received(String identity, long connectionId, WaypearlLocalMessenger.MessageType type, String text) {
+                mc.execute(() -> {
+                    if (messengerTransport == holder[0] && connectionId == holder[0].connectionId()
+                        && identity.equalsIgnoreCase(holder[0].peer())) {
+                        receiveMessenger(identity, type, text);
+                    }
+                });
+            }
+        });
+        return holder[0];
+    }
+
+    public void startMessengerHost() {
+        if (!messengerAvailable() || messengerRequester() || mc.world == null) {
+            error("Enable Waypearl messenger in assistant mode while connected to a world.");
+            return;
+        }
+        stopMessenger();
+        refreshMessengerAllowed();
+        messengerTransport = createMessenger();
+        messengerTransportMode = moduleMode.get();
+        messengerStatus = "Starting local listener...";
+        messengerTransport.startHost();
+    }
+
+    public void connectMessenger(String fingerprint, String password) {
+        if (!messengerAvailable() || !messengerRequester()) {
+            messengerStatus = "Enable Waypearl messenger in requester mode.";
+            return;
+        }
+        stopMessenger();
+        messengerTransport = createMessenger();
+        messengerTransportMode = moduleMode.get();
+        messengerStatus = "Connecting...";
+        messengerTransport.connect(mc.getSession().getUsername(), password, fingerprint);
+    }
+
+    public void enrollMessenger(String name, String password) {
+        if (!messengerAvailable() || messengerRequester() || !isMessengerPeerAllowed(name)) {
+            error("Add the requester to the assistant whitelist before creating credentials.");
+            return;
+        }
+        if (!WaypearlLocalMessenger.validPassword(password)) {
+            error("Use a password of 16-128 characters.");
+            return;
+        }
+        stopMessenger();
+        try {
+            createMessenger().enroll(name, password);
+            messengerStatus = "Credentials saved for " + name + ". Start the listener.";
+        } catch (Exception e) {
+            error("Could not save credentials: " + e.getMessage());
+        }
+    }
+
+    public void stopMessenger() {
+        WaypearlLocalMessenger previous = messengerTransport;
+        messengerTransport = null;
+        messengerTransportMode = null;
+        messengerStatus = "Disconnected";
+        armedPull = null;
+        if (pendingStrictOwner) {
+            pullQueued.set(false);
+            pendingStrictOwner = false;
+            pendingNotifyTarget = null;
+        }
+        if (previous != null) previous.close();
+    }
+
+    public boolean sendMessenger(String peer, String message) {
+        if (!messengerAvailable() || messengerTransport == null || (!messengerRequester() && mc.world == null)) {
+            recordMessenger("Messenger is unavailable.");
+            return false;
+        }
+        String text = message.trim();
+        if (!messengerRequester() && (!isMessengerPeerAllowed(peer) || !peer.equalsIgnoreCase(messengerTransport.peer()))) {
+            error("Recipient is not the connected, whitelisted requester.");
+            return false;
+        }
+        try {
+            messengerTransport.send(false, text);
+            recordMessenger("You: " + text);
+            return true;
+        } catch (IOException e) {
+            recordMessenger("Could not send message: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public void sendMessengerPull() {
+        String phrase = triggerPhrase.get().split(",", -1)[0].trim();
+        if (phrase.isEmpty()) {
+            recordMessenger("Configure a pull trigger phrase first.");
+            return;
+        }
+        if (!messengerAvailable() || !messengerRequester() || messengerTransport == null) {
+            recordMessenger("Messenger is not connected.");
+            return;
+        }
+        try {
+            messengerTransport.send(true, phrase);
+            recordMessenger("You: " + phrase);
+        } catch (IOException e) {
+            recordMessenger("Could not send pull request: " + e.getMessage());
+        }
+    }
+
+    public void sendArmedPull(boolean cancel) {
+        if (!messengerAvailable() || !messengerRequester() || messengerTransport == null) {
+            messengerStatus = "Connect to the assistant first.";
+            return;
+        }
+        try {
+            messengerTransport.send(cancel ? WaypearlLocalMessenger.MessageType.CANCEL : WaypearlLocalMessenger.MessageType.ARM,
+                cancel ? "Cancel armed pull" : "Arm pull for server join");
+            recordMessenger(cancel ? "You: cancel armed pull" : "You: arm pull for server join");
+        } catch (IOException e) {
+            messengerStatus = "Could not send request: " + e.getMessage();
+            recordMessenger(messengerStatus);
         }
     }
 
@@ -670,13 +1051,14 @@ public class Waypearl extends Module {
             return;
         }
 
-        if (walkState != WalkState.IDLE && walkState != WalkState.ABORTED) {
+        if (armedPull != null || pullQueued.get() || activePull != null || (walkState != WalkState.IDLE && walkState != WalkState.ABORTED)) {
             mc.player.sendMessage(Text.literal("[Waypearl] Walker active — ignoring."), false);
             return;
         }
 
         lastTriggerMs.set(nowMs);
         pendingNotifyTarget = senderName;
+        pendingStrictOwner = false;
         pullQueued.set(true);
         mc.player.sendMessage(Text.literal("[Waypearl] Pull triggered by " + senderName + "."), false);
     }
@@ -760,7 +1142,40 @@ public class Waypearl extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
+        refreshMessengerAllowed();
+        if (messengerTransport != null && (!messengerEnabled.get() || messengerTransportMode != moduleMode.get()
+            || (moduleMode.get() == ModuleMode.Assistant && (mc.world == null || mc.player == null))
+            || (moduleMode.get() == ModuleMode.Assistant && !messengerTransport.peer().isEmpty()
+                && !isMessengerPeerAllowed(messengerTransport.peer())))) stopMessenger();
         if (mc.world == null || mc.player == null) return;
+        if (moduleMode.get() != ModuleMode.Assistant) {
+            if (walkState != WalkState.IDLE && walkState != WalkState.ABORTED) abortWalk("Assistant mode changed.");
+            activePull = null;
+            followups.clear();
+            followupMessages.clear();
+        }
+        flushFollowupMessages();
+        tickArmedPull();
+        if (activePull != null && !activePull.interactionSent
+            && (!isMessengerPeerAllowed(activePull.requester) || (activePull.direct
+                && (!messengerAvailable() || messengerTransport == null
+                    || !activePull.requester.equalsIgnoreCase(messengerTransport.peer()))))) {
+            if (walkState == WalkState.WALKING_TO || walkState == WalkState.PULLING) {
+                abortWalk("Requester disconnected or is no longer whitelisted.");
+            } else failActivePull("Requester disconnected or is no longer whitelisted.");
+        }
+        boolean openPressed = messengerOpenKey.get().isPressed();
+        boolean pullPressed = messengerPullKey.get().isPressed();
+        boolean quickPressed = messengerQuickKey.get().isPressed();
+        if (messengerEnabled.get() && mc.currentScreen == null) {
+            if (openPressed && !wasMessengerOpenPressed) mc.setScreen(new WaypearlMessengerScreen(GuiThemes.get(), this));
+            else if (pullPressed && !wasMessengerPullPressed && messengerRequester()) sendMessengerPull();
+            else if (quickPressed && !wasMessengerQuickPressed) sendMessenger(messengerPeer(), messengerQuickMessage.get());
+        }
+        wasMessengerOpenPressed = openPressed;
+        wasMessengerPullPressed = pullPressed;
+        wasMessengerQuickPressed = quickPressed;
+        if (walkWorld != null && mc.world != walkWorld) abortWalk("World changed.");
         if (mc.world.getRegistryKey() == World.NETHER) return;
 
         boolean selfPressed = selfTriggerKey.get().isPressed();
@@ -789,19 +1204,48 @@ public class Waypearl extends Module {
 
         if (pullQueued.compareAndSet(true, false)) {
             String requester = pendingNotifyTarget;
-            sendNotifyMessage(requester);
-            executePull(requester);
+            if (!pendingStrictOwner || (messengerAvailable() && moduleMode.get() == ModuleMode.Assistant
+                && messengerTransport != null && isMessengerPeerAllowed(requester)
+                && requester.equalsIgnoreCase(messengerTransport.peer()))) executePull(requester, pendingStrictOwner);
             pendingNotifyTarget = null;
+            pendingStrictOwner = false;
         }
 
         tickWalker();
         updatePearlMemory();
+        tickPullFollowups();
 
         tickCounter++;
         if (tickCounter >= scanInterval.get()) {
             tickCounter = 0;
             triggerColumnScan();
         }
+    }
+
+    private void tickArmedPull() {
+        ArmedPull job = armedPull;
+        if (job == null) return;
+        boolean connected = messengerTransport != null && messengerTransport.connectionId() == job.connectionId()
+            && job.requester().equalsIgnoreCase(messengerTransport.peer());
+        boolean sameWorld = job.server().equals(currentServerKey()) && job.dimension().equals(currentDimensionKey());
+        WaypearlArmedPullPolicy.Decision decision = WaypearlArmedPullPolicy.evaluate(
+            connected, isMessengerPeerAllowed(job.requester()), messengerAvailable() && messengerAutoPull.get(),
+            sameWorld, isPlayerOnline(job.requester()),
+            !pullQueued.get() && activePull == null && (walkState == WalkState.IDLE || walkState == WalkState.ABORTED));
+        if (decision == WaypearlArmedPullPolicy.Decision.CANCEL) {
+            armedPull = null;
+            if (connected) sendMessenger(job.requester(), sameWorld
+                ? "Armed pull cancelled: whitelist or auto-pull changed."
+                : "Armed pull cancelled: assistant changed server or dimension.");
+            warning("Armed pull cancelled: connection, whitelist, settings, server, or dimension changed.");
+            return;
+        }
+        if (decision == WaypearlArmedPullPolicy.Decision.WAIT) return;
+        armedPull = null;
+        sendMessenger(job.requester(), "You joined. Checking your pearl now.");
+        pendingNotifyTarget = job.requester();
+        pendingStrictOwner = true;
+        pullQueued.set(true);
     }
 
     private void sendSelfTrigger() {
@@ -877,11 +1321,16 @@ public class Waypearl extends Module {
     private void sendNotifyMessage(String target) {
         if (!notifyEnabled.get() || target == null || target.isEmpty() || mc.player == null) return;
         String msg = notifyMessage.get().replace("{player}", target);
-        mc.player.networkHandler.sendChatMessage("/msg " + target + " " + msg);
+        mc.player.networkHandler.sendChatCommand("msg " + target + " " + msg);
     }
 
-    private void executePull(String requester) {
+    private void executePull(String requester, boolean strictOwner) {
         if (mc.world == null || mc.player == null) return;
+        if ((walkState != WalkState.IDLE && walkState != WalkState.ABORTED) || activePull != null) {
+            warning("Cannot start another pull while the assistant is busy.");
+            if (strictOwner && requester != null) sendMessenger(requester, "Assistant is busy with another pull.");
+            return;
+        }
 
         String botName = botUsername.get().trim();
         String server = currentServerKey();
@@ -898,14 +1347,16 @@ public class Waypearl extends Module {
             }
         }
 
-        if (candidates.isEmpty()) candidates = scanLiveTargets();
+        if (candidates.isEmpty() && !strictOwner) candidates = scanLiveTargets();
 
         if (requester != null) {
-            candidates.removeIf(rec -> !rec.owner().equalsIgnoreCase(requester) && !rec.owner().equalsIgnoreCase("unknown"));
+            candidates.removeIf(rec -> !rec.owner().equalsIgnoreCase(requester)
+                && (strictOwner || !rec.owner().equalsIgnoreCase("unknown")));
         }
 
         if (candidates.isEmpty()) {
             mc.player.sendMessage(Text.literal("[Waypearl] No valid stasis pearls found for " + (requester != null ? requester : "anyone") + "."), false);
+            if (strictOwner && requester != null) sendMessenger(requester, "No available pearl found for you.");
             return;
         }
 
@@ -925,7 +1376,20 @@ public class Waypearl extends Module {
             return 0;
         });
 
-        dispatchTarget(candidates.get(0).trapdoor());
+        if (strictOwner && requester != null && notifyEnabled.get()) {
+            sendMessenger(requester, notifyMessage.get().replace("{player}", requester));
+        } else if (!strictOwner) sendNotifyMessage(requester);
+        PearlRecord selected = candidates.get(0);
+        if (requester != null && requester.equalsIgnoreCase(selected.owner())) {
+            Set<UUID> existing = new HashSet<>();
+            synchronized (pearlMemory) {
+                for (PearlRecord pearl : pearlMemory.values()) {
+                    if (pearl.server().equals(server) && pearl.dimension().equals(dimension)) existing.add(pearl.uuid());
+                }
+            }
+            activePull = new PullFollowup(selected, requester, strictOwner, existing);
+        }
+        dispatchTarget(selected);
     }
 
     private boolean pearlStillExists(UUID pearlUuid) {
@@ -933,6 +1397,188 @@ public class Waypearl extends Module {
             if (e.getUuid().equals(pearlUuid) && e.getType() == EntityType.ENDER_PEARL) return true;
         }
         return false;
+    }
+
+    private void failActivePull(String message) {
+        PullFollowup job = activePull;
+        if (job == null) return;
+        activePull = null;
+        notifyFollowup(job, message);
+    }
+
+    private void notifyFollowup(PullFollowup job, String message) {
+        if (job.direct) {
+            if (messengerTransport != null && isMessengerPeerAllowed(job.requester)
+                && job.requester.equalsIgnoreCase(messengerTransport.peer())) {
+                sendMessenger(job.requester, message);
+            } else {
+                warning("Could not send follow-up to %s: messenger disconnected.", job.requester);
+            }
+        } else if (followupMessages.size() < 64) {
+            followupMessages.addLast(new FollowupMessage(job.pearl.server(), job.requester, message));
+        } else {
+            warning("Could not queue follow-up for %s: message queue is full.", job.requester);
+        }
+    }
+
+    private void flushFollowupMessages() {
+        if (mc.player.networkHandler == null) return;
+        long now = System.currentTimeMillis();
+        long lastSent = Math.max(lastFollowupMessageMs, lastTriggerMs.get());
+        if (now - lastSent < pullCooldown.get() * 1000L) return;
+        Iterator<FollowupMessage> iterator = followupMessages.iterator();
+        while (iterator.hasNext()) {
+            FollowupMessage message = iterator.next();
+            if (!isMessengerPeerAllowed(message.requester())) {
+                iterator.remove();
+                warning("Cancelled queued follow-up for %s: requester is no longer whitelisted.", message.requester());
+                continue;
+            }
+            if (!message.server().equals(currentServerKey()) || !isPlayerOnline(message.requester())) continue;
+            mc.player.networkHandler.sendChatCommand("msg " + message.requester() + " " + message.text());
+            lastFollowupMessageMs = now;
+            iterator.remove();
+            return;
+        }
+    }
+
+    private boolean followupChannelAvailable(PullFollowup job) {
+        if (job.direct) {
+            return messengerAvailable() && messengerTransport != null && isMessengerPeerAllowed(job.requester)
+                && job.requester.equalsIgnoreCase(messengerTransport.peer());
+        }
+        return isPlayerOnline(job.requester);
+    }
+
+    private PlayerEntity requesterInWorld(String requester) {
+        for (PlayerEntity player : mc.world.getPlayers()) {
+            if (player != mc.player && player.getName().getString().equalsIgnoreCase(requester)) return player;
+        }
+        return null;
+    }
+
+    private boolean sameFollowupWorld(PullFollowup job) {
+        return job.pearl.server().equals(currentServerKey()) && job.pearl.dimension().equals(currentDimensionKey());
+    }
+
+    private void tickPullFollowups() {
+        long now = System.currentTimeMillis();
+        if (activePull != null && activePull.interactionSent) {
+            PullFollowup job = activePull;
+            if (!isMessengerPeerAllowed(job.requester)) {
+                failActivePull("Requester is no longer whitelisted.");
+                return;
+            }
+            PlayerEntity requester = sameFollowupWorld(job) ? requesterInWorld(job.requester) : null;
+            BlockPos pearlPos = job.pearl.pearlPos();
+            boolean chunkLoaded = sameFollowupWorld(job)
+                && mc.world.getChunkManager().getWorldChunk(pearlPos.getX() >> 4, pearlPos.getZ() >> 4) != null;
+            double distance = requester == null ? Double.POSITIVE_INFINITY
+                : requester.squaredDistanceTo(Vec3d.ofCenter(pearlPos));
+            if (WaypearlFollowupPolicy.pullConfirmed(sameFollowupWorld(job), chunkLoaded,
+                pearlStillExists(job.pearl.uuid()), requester != null, distance)) {
+                activePull = null;
+                job.dropPending = replacePearl.get();
+                job.reminderPending = pearlReminder.get();
+                job.dropDeadline = now + 30_000L;
+                job.reminderDeadline = now + pearlReminderDelay.get() * 1000L;
+                followups.add(job);
+                notifyFollowup(job, "Pull confirmed. Please place a new stasis pearl.");
+            } else if (now >= job.confirmationDeadline) {
+                failActivePull("Could not confirm the pull; no replacement pearl was dropped.");
+            }
+        }
+
+        Iterator<PullFollowup> iterator = followups.iterator();
+        while (iterator.hasNext()) {
+            PullFollowup job = iterator.next();
+            if (!isMessengerPeerAllowed(job.requester)) {
+                iterator.remove();
+                followupMessages.removeIf(message -> message.requester().equalsIgnoreCase(job.requester));
+                warning("Cancelled follow-up for %s: requester is no longer whitelisted.", job.requester);
+                continue;
+            }
+            if (job.reminderPending && hasReplacementPearl(job)) {
+                job.reminderPending = false;
+                if (followupChannelAvailable(job)) notifyFollowup(job, "Your new stasis pearl has been detected.");
+            }
+            if (job.dropPending && !replacePearl.get()) job.dropPending = false;
+            if (job.reminderPending && !pearlReminder.get()) job.reminderPending = false;
+            if (job.dropPending && now >= job.dropDeadline) {
+                job.dropPending = false;
+                warning("Could not deliver a replacement pearl to %s within 30 seconds.", job.requester);
+                notifyFollowup(job, "I couldn't deliver a replacement pearl. Please bring one.");
+            } else if (job.dropPending && job.dropRotation.ready(now, job.dropDeadline) && sameFollowupWorld(job)) {
+                tryDropReplacement(job, now);
+            }
+            if (WaypearlFollowupPolicy.reminderDue(job.reminderPending, now, job.reminderDeadline)
+                && followupChannelAvailable(job)) {
+                String reminder = "You have forgotten to place down a pearl, come back.";
+                if (job.direct) {
+                    notifyFollowup(job, reminder);
+                    job.reminderPending = false;
+                } else if (now - Math.max(lastFollowupMessageMs, lastTriggerMs.get()) >= pullCooldown.get() * 1000L) {
+                    mc.player.networkHandler.sendChatCommand("msg " + job.requester + " " + reminder);
+                    lastFollowupMessageMs = now;
+                    job.reminderPending = false;
+                }
+            }
+            if (!job.dropPending && !job.reminderPending) iterator.remove();
+        }
+    }
+
+    private boolean hasReplacementPearl(PullFollowup job) {
+        if (!sameFollowupWorld(job)) return false;
+        synchronized (pearlMemory) {
+            for (PearlRecord pearl : pearlMemory.values()) {
+                boolean correctWorld = pearl.server().equals(job.pearl.server())
+                    && pearl.dimension().equals(job.pearl.dimension());
+                boolean validTrapdoor = correctWorld && pearl.trapdoor() != null
+                    && isAnyTrapdoor(mc.world.getBlockState(pearl.trapdoor()).getBlock());
+                if (WaypearlFollowupPolicy.isReplacement(correctWorld, pearl.owner().equalsIgnoreCase(job.requester),
+                    pearl.uuid(), job.existingPearls, validTrapdoor, correctWorld && pearlStillExists(pearl.uuid()))) return true;
+            }
+        }
+        return false;
+    }
+
+    private void tryDropReplacement(PullFollowup job, long now) {
+        if (job.direct && !followupChannelAvailable(job)) return;
+        PlayerEntity target = requesterInWorld(job.requester);
+        double distance = target == null ? Double.POSITIVE_INFINITY : mc.player.squaredDistanceTo(target);
+        if (mc.interactionManager == null || !WaypearlFollowupPolicy.canDrop(sameFollowupWorld(job), target != null,
+            distance, mc.player.currentScreenHandler == mc.player.playerScreenHandler)) return;
+        int slotId = -1;
+        for (Slot slot : mc.player.playerScreenHandler.slots) {
+            if (slot.inventory == mc.player.getInventory() && slot.getIndex() >= 0 && slot.getIndex() < 36
+                && slot.getStack().isOf(Items.ENDER_PEARL)) {
+                slotId = slot.id;
+                break;
+            }
+        }
+        if (slotId < 0) {
+            job.dropPending = false;
+            notifyFollowup(job, "I don't have a replacement pearl. Please bring one.");
+            return;
+        }
+        int selectedSlot = slotId;
+        long attempt = job.dropRotation.begin(now);
+        Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target), () -> {
+            if (!isActive() || !job.dropPending || !followups.contains(job) || mc.player == null || mc.world == null
+                || !job.dropRotation.accept(attempt, System.currentTimeMillis(), job.dropDeadline)
+                || !replacePearl.get() || mc.interactionManager == null || !sameFollowupWorld(job)
+                || !isMessengerPeerAllowed(job.requester)
+                || (job.direct && !followupChannelAvailable(job))
+                || mc.player.currentScreenHandler != mc.player.playerScreenHandler) return;
+            PlayerEntity currentTarget = requesterInWorld(job.requester);
+            if (currentTarget == null || mc.player.squaredDistanceTo(currentTarget) > 9) return;
+            Slot slot = mc.player.playerScreenHandler.getSlot(selectedSlot);
+            if (slot.inventory != mc.player.getInventory() || !slot.getStack().isOf(Items.ENDER_PEARL)) return;
+            job.dropRotation.complete();
+            job.dropPending = false;
+            mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, selectedSlot, 0, SlotActionType.THROW, mc.player);
+            notifyFollowup(job, "I attempted to drop a replacement pearl nearby. Please check and pick it up.");
+        });
     }
 
     private List<PearlRecord> scanLiveTargets() {
@@ -1073,20 +1719,26 @@ public class Waypearl extends Module {
         }
     }
 
-    private void dispatchTarget(BlockPos trapdoor) {
+    private void dispatchTarget(PearlRecord pearl) {
+        BlockPos trapdoor = pearl.trapdoor();
         double dist = com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(Vec3d.ofCenter(trapdoor));
         if (dist <= interactReach.get()) {
             interactTrapdoor(trapdoor);
         } else if (walkerEnabled.get()) {
-            beginWalk(trapdoor);
+            beginWalk(pearl);
         } else {
             mc.player.sendMessage(Text.literal("[Waypearl] Trapdoor out of reach and walker is disabled."), false);
+            failActivePull("The trapdoor is out of reach and the walker is disabled.");
         }
     }
 
-    private void beginWalk(BlockPos target) {
-        walkTarget   = target;
+    private void beginWalk(PearlRecord pearl) {
+        walkTarget   = pearl.trapdoor();
+        walkPearlId  = pearl.uuid();
+        walkWorld    = mc.world;
         idlePosition = com.example.addon.utils.MinecraftCompat.position(mc.player);
+        walkGeneration++;
+        walkInteractionPending = false;
         walkState    = WalkState.WALKING_TO;
         walkTicks    = 0;
         stuckTicks   = 0;
@@ -1094,7 +1746,7 @@ public class Waypearl extends Module {
         lastPos      = idlePosition;
         waypoints.clear();
 
-        List<Vec3d> path = findPath(mc.player.getBlockPos(), target);
+        List<Vec3d> path = findPath(mc.player.getBlockPos(), walkTarget, true);
         if (path != null) {
             waypoints.addAll(path);
         } else {
@@ -1148,7 +1800,6 @@ public class Waypearl extends Module {
                         if (walkerJump.get() && stuckTicks >= jumpAttemptTicks.get() && jumpCooldown == 0 && mc.player.isOnGround()) {
                             mc.player.jump();
                             jumpCooldown = jumpCooldownTicks.get();
-                            stuckTicks = 0;
                         }
                         if (stuckTicks >= stuckThresholdTicks.get()) {
                             abortWalk("Stuck for " + stuckTicks + " ticks.");
@@ -1164,59 +1815,60 @@ public class Waypearl extends Module {
                     abortWalk("Trapdoor vanished.");
                     return;
                 }
+                if (walkPearlId == null || !pearlStillExists(walkPearlId)) {
+                    abortWalk("The target pearl is no longer loaded.");
+                    return;
+                }
+
+                if (pos.distanceTo(Vec3d.ofCenter(walkTarget)) <= interactReach.get()) {
+                    stopMovement();
+                    walkState = WalkState.PULLING;
+                    walkTicks = 0;
+                    return;
+                }
 
                 Vec3d currentWaypoint = waypoints.peek();
                 if (currentWaypoint == null) {
-                    stopMovement();
-                    walkState = WalkState.PULLING;
-                    walkTicks = 0;
+                    abortWalk("Path ended outside trapdoor reach.");
+                    return;
+                }
+                if (!isWalkable(BlockPos.ofFloored(currentWaypoint))) {
+                    abortWalk("The route is no longer clear.");
                     return;
                 }
 
-                double distToWaypoint = pos.distanceTo(currentWaypoint);
-                boolean isFinalWaypoint = waypoints.size() == 1;
-
-                if (isFinalWaypoint && distToWaypoint <= interactReach.get()) {
+                if (atWaypoint(pos, currentWaypoint, waypointTolerance())) {
                     stopMovement();
-                    walkState = WalkState.PULLING;
-                    walkTicks = 0;
-                    return;
-                }
-
-                double advanceThreshold = isFinalWaypoint ? interactReach.get() : waypointSpacing.get() * 0.5;
-                if (distToWaypoint <= advanceThreshold) {
                     waypoints.poll();
                     return;
                 }
 
-                double distToFinal = walkTarget != null ? pos.distanceTo(Vec3d.ofCenter(walkTarget)) : distToWaypoint;
+                double distToFinal = pos.distanceTo(Vec3d.ofCenter(walkTarget));
                 boolean inSlowZone = distToFinal <= slowZoneRadius.get();
+                jumpForWaypoint(pos, currentWaypoint);
                 faceAndWalkToward(pos, currentWaypoint, !inSlowZone);
             }
 
             case PULLING -> {
+                if (++walkTicks > walkTimeoutTicks.get()) {
+                    abortWalk("Trapdoor interaction timed out.");
+                    return;
+                }
+                if (walkInteractionPending) return;
                 stopMovement();
-                if (sneakOnInteract.get()) {
-                    mc.options.sneakKey.setPressed(true);
-                    mc.player.setSneaking(true);
-                }
-                interactTrapdoor(walkTarget);
-                if (sneakOnInteract.get()) {
-                    mc.options.sneakKey.setPressed(false);
-                    mc.player.setSneaking(false);
-                }
-
-                if (returnAfterPull.get() && idlePosition != null) {
-                    walkState  = WalkState.WALKING_BACK;
-                    walkTicks  = 0;
-                    stuckTicks = 0;
-                    lastPos    = com.example.addon.utils.MinecraftCompat.position(mc.player);
-                    buildReturnWaypoints();
-                    mc.player.sendMessage(Text.literal("[Waypearl] Returning to idle."), false);
-                } else {
-                    walkState = WalkState.IDLE;
-                    resetWalkerFields();
-                }
+                if (mc.player.isSneaking()) return;
+                walkInteractionPending = true;
+                long generation = walkGeneration;
+                interactTrapdoor(walkTarget, () -> {
+                    if (walkState != WalkState.PULLING || generation != walkGeneration) return;
+                    walkInteractionPending = false;
+                    stopMovement();
+                    if (returnAfterPull.get() && idlePosition != null) beginReturn();
+                    else {
+                        walkState = WalkState.IDLE;
+                        resetWalkerFields();
+                    }
+                });
             }
 
             case WALKING_BACK -> {
@@ -1236,7 +1888,6 @@ public class Waypearl extends Module {
                         if (walkerJump.get() && stuckTicks >= jumpAttemptTicks.get() && jumpCooldown == 0 && mc.player.isOnGround()) {
                             mc.player.jump();
                             jumpCooldown = jumpCooldownTicks.get();
-                            stuckTicks = 0;
                         }
                         if (stuckTicks >= stuckThresholdTicks.get()) {
                             mc.player.sendMessage(Text.literal("[Waypearl] Stuck returning; stopping here."), false);
@@ -1253,26 +1904,26 @@ public class Waypearl extends Module {
 
                 Vec3d currentWaypoint = waypoints.peek();
                 if (currentWaypoint == null) {
-                    snapToIdle();
+                    abortWalk("Return path ended before reaching the idle position.");
+                    return;
+                }
+                if (!isWalkable(BlockPos.ofFloored(currentWaypoint))) {
+                    abortWalk("The return route is no longer clear.");
                     return;
                 }
 
-                double distToWaypoint = pos.distanceTo(currentWaypoint);
                 boolean isFinal = waypoints.size() == 1;
-
-                if (isFinal && distToWaypoint <= returnTolerance.get()) {
-                    snapToIdle();
-                    return;
-                }
-
-                double advanceThreshold = isFinal ? returnTolerance.get() : waypointSpacing.get() * 0.5;
-                if (distToWaypoint <= advanceThreshold) {
+                double tolerance = isFinal ? returnTolerance.get() : waypointTolerance();
+                if (atWaypoint(pos, currentWaypoint, tolerance)) {
+                    stopMovement();
                     waypoints.poll();
+                    if (isFinal) finishReturn();
                     return;
                 }
 
                 double distToHome = pos.distanceTo(idlePosition);
                 boolean inSlowZone = distToHome <= slowZoneRadius.get();
+                jumpForWaypoint(pos, currentWaypoint);
                 faceAndWalkToward(pos, currentWaypoint, !inSlowZone);
             }
 
@@ -1280,83 +1931,88 @@ public class Waypearl extends Module {
         }
     }
 
-    private void snapToIdle() {
+    private void finishReturn() {
         stopMovement();
-        mc.player.setPosition(idlePosition.x, idlePosition.y, idlePosition.z);
         mc.player.sendMessage(Text.literal("[Waypearl] Returned to idle position."), false);
         walkState = WalkState.IDLE;
         resetWalkerFields();
     }
 
-    private void buildReturnWaypoints() {
+    private void beginReturn() {
         waypoints.clear();
-        if (idlePosition == null) return;
-        List<Vec3d> path = findPath(mc.player.getBlockPos(), BlockPos.ofFloored(idlePosition));
-        if (path != null) waypoints.addAll(path);
+        List<Vec3d> path = findPath(mc.player.getBlockPos(), BlockPos.ofFloored(idlePosition), false);
+        if (path == null) {
+            warning("No safe return path to the saved idle position.");
+            stopMovement();
+            walkState = WalkState.IDLE;
+            resetWalkerFields();
+            return;
+        }
+        waypoints.addAll(path);
+        waypoints.addLast(idlePosition);
+        walkState = WalkState.WALKING_BACK;
+        walkTicks = 0;
+        stuckTicks = 0;
+        lastPos = com.example.addon.utils.MinecraftCompat.position(mc.player);
+        mc.player.sendMessage(Text.literal("[Waypearl] Returning to idle."), false);
     }
 
-    private List<Vec3d> findPath(BlockPos start, BlockPos end) {
-        Queue<BlockPos> queue = new ArrayDeque<>();
-        Map<BlockPos, BlockPos> parents = new HashMap<>();
-        Set<BlockPos> visited = new HashSet<>();
-
-        queue.add(start);
-        visited.add(start);
-
-        BlockPos currentEnd = null;
-        int iterations = 0;
-
-        while (!queue.isEmpty() && iterations < 1500) {
-            iterations++;
-            BlockPos curr = queue.poll();
-
-            if (curr.getSquaredDistance(end) <= interactReach.get() * interactReach.get()) {
-                currentEnd = curr;
-                break;
-            }
-
-            for (Direction dir : Direction.values()) {
-                if (dir.getAxis().isHorizontal()) {
-                    BlockPos next = curr.offset(dir);
-                    if (isWalkable(next) && !visited.contains(next)) {
-                        visited.add(next);
-                        parents.put(next, curr);
-                        queue.add(next);
-                    } else if (isPassable(curr.up(2)) && isWalkable(next.up()) && !visited.contains(next.up())) {
-                        BlockPos up = next.up();
-                        visited.add(up);
-                        parents.put(up, curr);
-                        queue.add(up);
-                    } else if (isPassable(next) && isPassable(next.up())) {
-                        BlockPos drop = next.down();
-                        if (isWalkable(drop) && !visited.contains(drop)) {
-                            visited.add(drop);
-                            parents.put(drop, curr);
-                            queue.add(drop);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (currentEnd == null) return null;
-
+    private List<Vec3d> findPath(BlockPos start, BlockPos end, boolean interactionGoal) {
+        List<BlockPos> blocks = WaypearlPathfinder.find(start,
+            pos -> interactionGoal ? footPosition(pos).distanceTo(Vec3d.ofCenter(end)) <= interactReach.get() - waypointTolerance()
+                : pos.equals(end),
+            this::walkNeighbours, 6000);
+        if (blocks == null) return null;
         List<Vec3d> path = new ArrayList<>();
-        BlockPos p = currentEnd;
-        while (p != null) {
-            path.add(Vec3d.ofCenter(p));
-            p = parents.get(p);
-        }
-        Collections.reverse(path);
+        for (int i = 1; i < blocks.size(); i++) path.add(footPosition(blocks.get(i)));
         return path;
     }
 
+    private List<BlockPos> walkNeighbours(BlockPos current) {
+        List<BlockPos> result = new ArrayList<>(4);
+        for (Direction dir : Direction.values()) {
+            if (!dir.getAxis().isHorizontal()) continue;
+            BlockPos next = current.offset(dir);
+            if (isWalkable(next)) result.add(next);
+            else if (walkerJump.get() && isPassable(current.up(2)) && isWalkable(next.up())) result.add(next.up());
+            else if (isPassable(next) && isPassable(next.up()) && isWalkable(next.down())) {
+                result.add(next.down());
+            }
+        }
+        return result;
+    }
+
+    private Vec3d footPosition(BlockPos pos) {
+        return new Vec3d(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
+    }
+
+    private double waypointTolerance() {
+        return Math.min(0.35, waypointSpacing.get() * 0.05);
+    }
+
+    private boolean atWaypoint(Vec3d position, Vec3d target, double tolerance) {
+        return xzDist(position, target) <= tolerance && Math.abs(position.y - target.y) < 0.6;
+    }
+
+    private void jumpForWaypoint(Vec3d position, Vec3d waypoint) {
+        if (walkerJump.get() && waypoint.y > position.y + 0.5 && jumpCooldown == 0 && mc.player.isOnGround()) {
+            mc.player.jump();
+            jumpCooldown = jumpCooldownTicks.get();
+        }
+    }
+
     private boolean isPassable(BlockPos pos) {
-        return mc.world.getBlockState(pos).getCollisionShape(mc.world, pos).isEmpty();
+        if (mc.world.getChunkManager().getWorldChunk(pos.getX() >> 4, pos.getZ() >> 4) == null) return false;
+        BlockState state = mc.world.getBlockState(pos);
+        return state.getFluidState().isEmpty() && state.getBlock() != Blocks.FIRE && state.getBlock() != Blocks.SOUL_FIRE
+            && state.getCollisionShape(mc.world, pos).isEmpty();
     }
 
     private boolean isWalkable(BlockPos pos) {
-        return isPassable(pos) && isPassable(pos.up()) && !isPassable(pos.down());
+        if (!isPassable(pos) || !isPassable(pos.up())) return false;
+        BlockPos support = pos.down();
+        BlockState state = mc.world.getBlockState(support);
+        return state.getFluidState().isEmpty() && !state.getCollisionShape(mc.world, support).isEmpty();
     }
 
     private void faceAndWalkToward(Vec3d from, Vec3d to, boolean sprint) {
@@ -1392,6 +2048,7 @@ public class Waypearl extends Module {
     }
 
     private void abortWalk(String reason) {
+        failActivePull("Pull cancelled: " + reason);
         stopMovement();
         walkState = WalkState.ABORTED;
         resetWalkerFields();
@@ -1400,6 +2057,10 @@ public class Waypearl extends Module {
     }
 
     private void resetWalkerFields() {
+        walkGeneration++;
+        walkPearlId = null;
+        walkWorld = null;
+        walkInteractionPending = false;
         walkTarget   = null;
         idlePosition = null;
         walkTicks    = 0;
@@ -1433,14 +2094,78 @@ public class Waypearl extends Module {
     }
 
     private void interactTrapdoor(BlockPos pos) {
+        interactTrapdoor(pos, null);
+    }
+
+    private void interactTrapdoor(BlockPos pos, Runnable onComplete) {
         if (pos == null) return;
+        PullFollowup job = activePull;
+        World interactionWorld = mc.world;
+        long generation = walkGeneration;
         Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos), () -> {
+            if (!isActive() || mc.world != interactionWorld || mc.player == null || mc.interactionManager == null
+                || (onComplete != null && (generation != walkGeneration || walkState != WalkState.PULLING))
+                || (job != null && activePull != job)) return;
+            if (job != null && (!isMessengerPeerAllowed(job.requester) || (job.direct
+                && (!messengerAvailable() || messengerTransport == null
+                    || !job.requester.equalsIgnoreCase(messengerTransport.peer()))))) {
+                failActivePull("Requester disconnected or is no longer whitelisted.");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+            if (!isAnyTrapdoor(mc.world.getBlockState(pos).getBlock())
+                || com.example.addon.utils.MinecraftCompat.position(mc.player).distanceTo(Vec3d.ofCenter(pos)) > interactReach.get()
+                || (onComplete != null && (walkPearlId == null || !pearlStillExists(walkPearlId)))) {
+                warning("The pearl or trapdoor is no longer available or within reach.");
+                failActivePull("The pearl or trapdoor is no longer available or within reach.");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+            if (mc.player.isSneaking()) {
+                warning("Cannot activate the trapdoor while sneaking; release sneak and try again.");
+                failActivePull("Cannot activate the trapdoor while sneaking.");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+            if (mc.world.getBlockState(pos).isOf(Blocks.IRON_TRAPDOOR)) {
+                warning("Iron trapdoors require redstone and cannot be opened by hand.");
+                failActivePull("The iron trapdoor requires redstone and cannot be opened by hand.");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
+            int previousSlot = com.example.addon.utils.MinecraftCompat.selectedSlot(mc.player.getInventory());
+            boolean[] emptySlots = new boolean[9];
+            for (int i = 0; i < emptySlots.length; i++) {
+                emptySlots[i] = mc.player.getInventory().getStack(i).isEmpty();
+            }
+            int slot = WaypearlInteractionHand.select(previousSlot, mc.player.getOffHandStack().isEmpty(), emptySlots);
+            if (slot == WaypearlInteractionHand.UNAVAILABLE) {
+                warning("Cannot safely interact: empty an offhand or hotbar slot first.");
+                failActivePull("Cannot safely interact: the assistant needs an empty offhand or hotbar slot.");
+                if (onComplete != null) onComplete.run();
+                return;
+            }
             Vec3d          hitVec = Vec3d.ofCenter(pos);
             BlockHitResult hit    = new BlockHitResult(hitVec, Direction.UP, pos, false);
-            ActionResult   result = mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+            Hand hand = slot == WaypearlInteractionHand.OFFHAND ? Hand.OFF_HAND : Hand.MAIN_HAND;
+            boolean switched = hand == Hand.MAIN_HAND && slot != previousSlot;
+            if (switched) Hotbar.select(slot);
+            ActionResult result;
+            try {
+                result = mc.interactionManager.interactBlock(mc.player, hand, hit);
+            } finally {
+                if (switched) Hotbar.select(previousSlot);
+            }
 
-            String base = result.isAccepted() ? "[Waypearl] Trapdoor activated." : "[Waypearl] Interaction failed.";
+            String base = result.isAccepted() ? "[Waypearl] Trapdoor interaction sent." : "[Waypearl] Interaction failed.";
             mc.player.sendMessage(Text.literal(base), false);
+            if (job != null) {
+                if (result.isAccepted()) {
+                    job.interactionSent = true;
+                    job.confirmationDeadline = System.currentTimeMillis() + 15_000L;
+                } else failActivePull("The trapdoor interaction failed.");
+            }
+            if (onComplete != null) onComplete.run();
         });
     }
 

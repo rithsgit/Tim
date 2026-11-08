@@ -6,10 +6,16 @@
   "mixins": [],
   "client": [
     "RocketPilotInputMixin",
+    "OceanBreachMovementMixin",
+    "TweakerWaterSprintMixin",
     "ThirdSightMouseMixin",
     "ClientPlayerEntityMixin",
     "HandmoldMixin",
     "HeldItemRendererAccessor",
+    "IllumoodBiomeColorMixin",
+    "IllumoodLegacyBiomeColorMixin",
+    "IllumoodFogMixin",
+    "BookEditScreenSigningAccessor",
     "RocketPilotMixin",
     "HandledScreenMouseMixin"
   ],

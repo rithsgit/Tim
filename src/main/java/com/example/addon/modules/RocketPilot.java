@@ -5,6 +5,7 @@ import java.util.LinkedHashSet;
 import java.util.Set;
 
 import com.example.addon.Tim;
+import com.example.addon.utils.ElytraTakeoffSequence;
 
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
@@ -18,6 +19,7 @@ import meteordevelopment.meteorclient.settings.KeybindSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
@@ -32,6 +34,7 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -746,6 +749,11 @@ public class RocketPilot extends Module {
 
     public  long    lastRocketTime           = 0;
     private boolean needsTakeoffRocket       = false;
+    private ElytraTakeoffSequence takeoffSequence;
+    private boolean takeoffManualJump;
+    private boolean takeoffSneakReleasePending;
+    private net.minecraft.client.network.ClientPlayerEntity takeoffPlayer;
+    private net.minecraft.client.world.ClientWorld takeoffWorld;
     private boolean ascentMode               = false;
     private final Set<Long> drunkVisitedChunks = new LinkedHashSet<>();
     private boolean pitch40Climbing          = false;
@@ -760,7 +768,6 @@ public class RocketPilot extends Module {
     private int     currentDrunkDuration     = 0;
     private int     totemPops                = 0;
     private int     takeoffTimer             = 0;
-    private int     takeoffWaitTicks         = 0;
 
     private boolean paused              = false;
     private Vec3d   origin              = null;
@@ -854,6 +861,10 @@ public class RocketPilot extends Module {
     public void onActivate() {
         lastRocketTime           = 0;
         needsTakeoffRocket       = false;
+        takeoffSequence          = null;
+        takeoffSneakReleasePending = false;
+        takeoffPlayer            = null;
+        takeoffWorld             = null;
         drunkTimer               = 0;
         currentDrunkDuration     = 0;
         ascentMode               = false;
@@ -863,7 +874,6 @@ public class RocketPilot extends Module {
         bounceClimbing           = true;
         lastLagbackTime          = 0;
         takeoffTimer             = 0;
-        takeoffWaitTicks         = 0;
 
         ebounceSlow = 0; ebounceWarm = 0; ebounceJump = 0;
         ebouncePass = false; ebounceStarted = false;
@@ -907,17 +917,16 @@ public class RocketPilot extends Module {
             return;
         }
 
-        targetPitch = -28.0f;
-        mc.player.setPitch(targetPitch);
-        mc.player.jump();
-        needsTakeoffRocket = true;
-        info("Taking off!");
+        beginTakeoff("Taking off!");
     }
 
     @Override
     public void onDeactivate() {
         needsTakeoffRocket = false;
-        takeoffWaitTicks   = 0;
+        takeoffSequence = null;
+        takeoffSneakReleasePending = false;
+        takeoffPlayer = null;
+        takeoffWorld = null;
         paused             = false;
         drunkVisitedChunks.clear();
 
@@ -930,8 +939,27 @@ public class RocketPilot extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (System.currentTimeMillis() - lastLagbackTime < 500) return;
-        if (mc.player == null || mc.world == null) return;
+        if (mc.player == null || mc.world == null || (takeoffPlayer != null
+            && (mc.player != takeoffPlayer || mc.world != takeoffWorld))) {
+            needsTakeoffRocket = false;
+            takeoffSequence = null;
+            takeoffSneakReleasePending = false;
+            takeoffPlayer = null;
+            takeoffWorld = null;
+            return;
+        }
+        if (takeoffSneakReleasePending && (!mc.isWindowFocused() || mc.currentScreen != null
+            || !mc.options.sneakKey.isPressed())) {
+            takeoffSneakReleasePending = false;
+            if (takeoffSequence == null) {
+                takeoffPlayer = null;
+                takeoffWorld = null;
+            }
+        }
+        if (System.currentTimeMillis() - lastLagbackTime < 500) {
+            if (needsTakeoffRocket) failTakeoff("Server corrected movement during takeoff.");
+            return;
+        }
 
         if (disconnectOnTotemPop.get()) {
             int currentPops = mc.player.getStatHandler().getStat(Stats.USED, Items.TOTEM_OF_UNDYING);
@@ -960,6 +988,11 @@ public class RocketPilot extends Module {
         }
 
         if (flightMode.get() == FlightMode.Ebounce) {
+            needsTakeoffRocket = false;
+            takeoffSequence = null;
+            takeoffSneakReleasePending = false;
+            takeoffPlayer = null;
+            takeoffWorld = null;
             handleEbounceTick();
             return;
         }
@@ -986,18 +1019,17 @@ public class RocketPilot extends Module {
         }
 
         if (hasElytra && !ignoreElytra.get() && isNearGround() && !mc.player.isGliding() && wantsToFly && autoTakeoff.get() && countFireworks() > 0 && !needsTakeoffRocket) {
-            targetPitch = -28.0f;
-            mc.player.setPitch(targetPitch);
-            if (mc.player.isOnGround()) mc.player.jump();
-            needsTakeoffRocket = true;
-            takeoffWaitTicks   = 0;
-            info("Re-launching!");
+            beginTakeoff("Re-launching!");
+            if (!isActive()) return;
         }
 
         if (needsTakeoffRocket) {
             if (!hasElytra || ignoreElytra.get()) {
                 needsTakeoffRocket = false;
-                takeoffWaitTicks   = 0;
+                takeoffSequence = null;
+                takeoffSneakReleasePending = false;
+                takeoffPlayer = null;
+                takeoffWorld = null;
             } else {
                 handleTakeoff();
                 return;
@@ -1241,31 +1273,103 @@ public class RocketPilot extends Module {
         return (int) Math.round(value / EBOUNCE_GRID) * EBOUNCE_GRID;
     }
 
-    private void handleTakeoff() {
+    private void beginTakeoff(String message) {
+        Tweaker tweaker = Modules.get().get(Tweaker.class);
+        if (tweaker != null && tweaker.hasActivePathOrTakeoff()) {
+            failTakeoff("A Tweaker path or takeoff is active.");
+            return;
+        }
+        if (!mc.isWindowFocused() || mc.currentScreen != null || mc.interactionManager == null
+            || !mc.player.isAlive() || mc.player.hasVehicle() || mc.player.getAbilities().flying
+            || mc.player.isTouchingWater() || mc.player.isInLava()) {
+            failTakeoff("Player state, an open screen, or lost focus prevents takeoff.");
+            return;
+        }
+        if (!shouldFireRocketForTakeoff()) {
+            failTakeoff("A usable elytra is required.");
+            return;
+        }
         if (mc.player.isOnGround()) {
-            mc.player.jump();
-            return;
-        }
-        if (!mc.player.isGliding()) {
-            if (mc.player.networkHandler != null) {
-                mc.player.networkHandler.sendPacket(
-                    new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING)
-                );
+            Box playerBox = mc.player.getBoundingBox();
+            Box clearance = new Box(playerBox.minX, playerBox.maxY, playerBox.minZ,
+                playerBox.maxX, playerBox.maxY + 2.0, playerBox.maxZ);
+            if (mc.world.getBlockCollisions(mc.player, clearance).iterator().hasNext()) {
+                failTakeoff("Insufficient overhead clearance.");
+                return;
             }
+        }
+        replenishRockets();
+        if (!hotbarHasRocket() && !mc.player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
+            failTakeoff("A rocket must be in the hotbar or offhand.");
             return;
         }
-        boolean rocketInHotbar = hotbarHasRocket();
-        if (!rocketInHotbar) {
-            takeoffWaitTicks++;
-            if (takeoffWaitTicks < 10) return;
+        targetPitch = -28.0f;
+        mc.player.setPitch(targetPitch);
+        takeoffPlayer = mc.player;
+        takeoffWorld = mc.world;
+        takeoffManualJump = mc.player.getAbilities().allowFlying;
+        takeoffSequence = new ElytraTakeoffSequence(mc.player.isOnGround());
+        needsTakeoffRocket = true;
+        info(message);
+    }
+
+    private boolean shouldFireRocketForTakeoff() {
+        ItemStack elytra = mc.player.getEquippedStack(EquipmentSlot.CHEST);
+        return elytra.isOf(Items.ELYTRA) && elytra.getDamage() < elytra.getMaxDamage() - 1;
+    }
+
+    private void handleTakeoff() {
+        if (!autoTakeoff.get() || !mc.isWindowFocused() || mc.currentScreen != null
+            || mc.interactionManager == null || !mc.player.isAlive() || mc.player.hasVehicle()
+            || mc.player.getAbilities().flying || mc.player.isTouchingWater() || mc.player.isInLava()
+            || !shouldFireRocketForTakeoff()) {
+            failTakeoff("Player state or settings no longer permit takeoff.");
+            return;
         }
-        if (shouldFireRocket() && countFireworks() > 0) {
-            fireRocket();
-            lastRocketTime = System.currentTimeMillis();
+        if (mc.player.horizontalCollision) {
+            failTakeoff("An obstacle was hit.");
+            return;
         }
-        needsTakeoffRocket = false;
-        takeoffWaitTicks   = 0;
-        takeoffTimer       = TAKEOFF_GRACE_TICKS;
+        switch (takeoffSequence.tick(mc.player.isOnGround(), mc.player.isGliding())) {
+            case Failed -> failTakeoff("Jump or elytra deployment failed.");
+            case Jump -> {
+                if (takeoffManualJump) mc.player.jump();
+            }
+            case Climb -> {
+                if (!shouldFireRocket() || !fireRocket()) {
+                    failTakeoff("No usable rocket, or rocket use was rejected.");
+                    return;
+                }
+                lastRocketTime = System.currentTimeMillis();
+                needsTakeoffRocket = false;
+                takeoffSequence = null;
+                takeoffSneakReleasePending = mc.options.sneakKey.isPressed();
+                if (!takeoffSneakReleasePending) {
+                    takeoffPlayer = null;
+                    takeoffWorld = null;
+                }
+                takeoffTimer = TAKEOFF_GRACE_TICKS;
+            }
+            case Wait, Deploy -> { }
+        }
+    }
+
+    private void failTakeoff(String reason) {
+        error("Auto-takeoff stopped: %s", reason);
+        toggle();
+    }
+
+    public Boolean takeoffJumpOverride() {
+        if (!isActive() || takeoffSequence == null || mc.player != takeoffPlayer
+            || mc.world != takeoffWorld || !mc.isWindowFocused() || mc.currentScreen != null) return null;
+        if (takeoffManualJump && takeoffSequence.phase() == ElytraTakeoffSequence.Phase.JumpPressed) return false;
+        return takeoffSequence.jumpPressed();
+    }
+
+    public boolean suppressTakeoffSneak() {
+        return isActive() && (takeoffSequence != null || takeoffSneakReleasePending)
+            && mc.player == takeoffPlayer && mc.world == takeoffWorld
+            && mc.isWindowFocused() && mc.currentScreen == null;
     }
 
     private boolean hotbarHasRocket() {
@@ -1890,8 +1994,8 @@ public class RocketPilot extends Module {
         return false;
     }
 
-    private void fireRocket() {
-        if (mc.player == null || mc.interactionManager == null) return;
+    private boolean fireRocket() {
+        if (mc.player == null || mc.interactionManager == null) return false;
 
         int rocketSlot = -1;
         for (int i = 0; i < 9; i++) {
@@ -1900,16 +2004,21 @@ public class RocketPilot extends Module {
 
         if (rocketSlot == -1) {
             if (mc.player.getOffHandStack().isOf(Items.FIREWORK_ROCKET)) {
-                mc.interactionManager.interactItem(mc.player, Hand.OFF_HAND);
-                if (!silentRockets.get()) mc.player.swingHand(Hand.OFF_HAND);
+                boolean accepted = mc.interactionManager.interactItem(mc.player, Hand.OFF_HAND).isAccepted();
+                if (accepted && !silentRockets.get()) mc.player.swingHand(Hand.OFF_HAND);
+                return accepted;
             }
-            return;
+            return false;
         }
 
-        InvUtils.swap(rocketSlot, true);
-        mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
-        if (!silentRockets.get()) mc.player.swingHand(Hand.MAIN_HAND);
-        InvUtils.swapBack();
+        if (!InvUtils.swap(rocketSlot, true)) return false;
+        try {
+            boolean accepted = mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND).isAccepted();
+            if (accepted && !silentRockets.get()) mc.player.swingHand(Hand.MAIN_HAND);
+            return accepted;
+        } finally {
+            InvUtils.swapBack();
+        }
     }
 
     private void disconnect(String reason) {

@@ -24,6 +24,7 @@ import com.example.addon.hud.ServerReportHUD;
 import com.example.addon.hud.StatisticsInformation;
 import com.example.addon.hud.TimeThrottleHUD;
 import com.example.addon.hud.TimmyIconHud;
+import com.example.addon.hud.WaypearlMessengerHud;
 import com.example.addon.modules.Baromine;
 import com.example.addon.modules.ChambersAssistant;
 import com.example.addon.modules.CityAssistant;
@@ -37,12 +38,14 @@ import com.example.addon.modules.Graveyard;
 import com.example.addon.modules.Groundwork;
 import com.example.addon.modules.Handhold;
 import com.example.addon.modules.Handmold;
+import com.example.addon.modules.Illumood;
 import com.example.addon.modules.Illushine;
 import com.example.addon.modules.InspectorGadget;
 import com.example.addon.modules.Inventory101;
 import com.example.addon.modules.LavaMarker;
 import com.example.addon.modules.LootLens;
 import com.example.addon.modules.ManorAssistant;
+import com.example.addon.modules.Manuscript;
 import com.example.addon.modules.Mendbot;
 import com.example.addon.modules.Mobanom;
 import com.example.addon.modules.NeighbourhoodWatch;
@@ -60,6 +63,7 @@ import com.example.addon.modules.Threaturn;
 import com.example.addon.modules.Timethrottle;
 import com.example.addon.modules.TotalDisposal;
 import com.example.addon.modules.Tunnelers;
+import com.example.addon.modules.Tweaker;
 import com.example.addon.modules.Waypearl;
 
 import meteordevelopment.meteorclient.addons.MeteorAddon;
@@ -92,12 +96,14 @@ public class Tim extends MeteorAddon {
         modules.add(new Groundwork());
         modules.add(new Handhold());
         modules.add(new Handmold());
+        modules.add(new Illumood());
         modules.add(new Illushine());
         modules.add(new InspectorGadget());
         modules.add(new Inventory101());
         modules.add(new LavaMarker());
         modules.add(new LootLens());
         modules.add(new ManorAssistant());
+        modules.add(new Manuscript());
         modules.add(new Mendbot());
         modules.add(new Mobanom());
         modules.add(new NeighbourhoodWatch());
@@ -115,6 +121,7 @@ public class Tim extends MeteorAddon {
         modules.add(new Timethrottle());
         modules.add(new TotalDisposal());
         modules.add(new Tunnelers());
+        modules.add(new Tweaker());
         modules.add(new Waypearl());
 
         // HUD elements (A-Z)
@@ -139,6 +146,7 @@ public class Tim extends MeteorAddon {
         Hud.get().register(StatisticsInformation.INFO);
         Hud.get().register(TimeThrottleHUD.INFO);
         Hud.get().register(TimmyIconHud.INFO);
+        Hud.get().register(WaypearlMessengerHud.INFO);
     }
 
     @Override

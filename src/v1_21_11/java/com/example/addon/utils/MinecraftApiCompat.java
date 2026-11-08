@@ -81,7 +81,7 @@ public final class MinecraftApiCompat {
             matrices.translate(base.x - cameraPos.x - 0.5, base.y - cameraPos.y, base.z - cameraPos.z - 0.5);
             var commandQueue = client.gameRenderer.getEntityRenderCommandQueue();
             BeaconBlockEntityRenderer.renderBeam(
-                matrices, commandQueue, texture, tickDelta, 1.0f, 0, height,
+                matrices, commandQueue, texture, 1.0f, Math.floorMod(worldTime, 40L) + tickDelta, 0, height,
                 packedColor, innerRadius, outerRadius
             );
         } finally {

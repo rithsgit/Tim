@@ -6,10 +6,15 @@
   "mixins": [],
   "client": [
     "RocketPilotInputMixin",
+    "OceanBreachMovementMixin",
     "ThirdSightMouseMixin",
     "ClientPlayerEntityMixin",
     "HandmoldMixin",
     "HeldItemRendererAccessor",
+    "IllumoodEnvironmentAttributeMixin",
+    "IllumoodFogRendererMixin",
+    "BookEditScreenModernAccessor",
+    "BookSigningScreenAccessor",
     "RocketPilotMixin",
     "HandledScreenMouseMixin"
   ],

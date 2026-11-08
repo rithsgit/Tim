@@ -10,15 +10,30 @@ import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.FallingBlock;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.Items;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.dimension.DimensionTypes;
 
 import com.example.addon.Tim;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
 public class SafetyNet extends Module {
 
@@ -48,6 +63,7 @@ public class SafetyNet extends Module {
     private final SettingGroup sgEnd        = settings.createGroup("End Thresholds");
     private final SettingGroup sgGrace      = settings.createGroup("Grace Period");
     private final SettingGroup sgChorus     = settings.createGroup("Chorus Escape");
+    private final SettingGroup sgPlatform   = settings.createGroup("Air Place Platform");
 
     private final Setting<DimensionMode> dimension = sgGeneral.add(new EnumSetting.Builder<DimensionMode>()
         .name("dimension")
@@ -187,6 +203,29 @@ public class SafetyNet extends Module {
         .build()
     );
 
+    private final Setting<Boolean> platformEnabled = sgPlatform.add(new BoolSetting.Builder()
+        .name("platform-enabled")
+        .description("Attempt a 5x5 air-place platform below you when the warning Y level is reached.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Integer> platformSlot = sgPlatform.add(new IntSetting.Builder()
+        .name("hotbar-slot")
+        .description("Hotbar slot containing solid, non-falling blocks for the platform (1-9).")
+        .defaultValue(1).range(1, 9).sliderRange(1, 9)
+        .visible(platformEnabled::get)
+        .build()
+    );
+
+    private final Setting<Boolean> disconnectOnDamage = sgPlatform.add(new BoolSetting.Builder()
+        .name("disconnect-on-damage")
+        .description("Disconnect on damage while the platform safeguard is engaged, in addition to the Y-level disconnect.")
+        .defaultValue(true)
+        .visible(platformEnabled::get)
+        .build()
+    );
+
     private boolean hasDisconnected;
     private int     warnTickCounter;
     private int     graceTickCounter;
@@ -194,6 +233,19 @@ public class SafetyNet extends Module {
     private boolean chorusEscapeActive;
     private boolean hasTriggeredEat;
     private boolean wasChorusPressed;
+    private boolean platformTriggered;
+    private boolean platformBuilding;
+    private int platformIndex;
+    private int platformDelay;
+    private int platformVerifyTicks;
+    private int platformRetries;
+    private final List<BlockPos> platformTargets = new ArrayList<>();
+    private ClientWorld platformWorld;
+    private ClientPlayerEntity platformPlayer;
+    private float lastHealth;
+    private float lastAbsorption;
+    private int lastHurtTime;
+    private boolean hasDamageBaseline;
 
     public SafetyNet() {
         super(Tim.CATEGORY, "Safety Net", "Protects you from the void by warning, disconnecting, or chorus teleporting at low Y levels.");
@@ -219,6 +271,11 @@ public class SafetyNet extends Module {
         chorusEscapeActive = false;
         hasTriggeredEat    = false;
         wasChorusPressed   = false;
+        resetPlatform();
+        platformTriggered = false;
+        hasDamageBaseline = false;
+        platformWorld = null;
+        platformPlayer = null;
     }
 
     private void resetCounters() {
@@ -228,13 +285,42 @@ public class SafetyNet extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.world == null) return;
+        if (mc.player == null || mc.world == null) {
+            resetPlatform();
+            platformTriggered = false;
+            hasDamageBaseline = false;
+            platformWorld = null;
+            platformPlayer = null;
+            return;
+        }
+
+        if (platformWorld != mc.world || platformPlayer != mc.player) {
+            resetPlatform();
+            platformTriggered = false;
+            hasDamageBaseline = false;
+            platformWorld = mc.world;
+            platformPlayer = mc.player;
+        }
+        float health = mc.player.getHealth();
+        float absorption = mc.player.getAbsorptionAmount();
+        int hurtTime = mc.player.hurtTime;
+        boolean damaged = hasDamageBaseline && (health < lastHealth || absorption < lastAbsorption || hurtTime > lastHurtTime);
+        lastHealth = health;
+        lastAbsorption = absorption;
+        lastHurtTime = hurtTime;
+        hasDamageBaseline = true;
 
         handleChorusEscapeKeybind();
-        if (chorusEscapeActive) return;
+        if (chorusEscapeActive) {
+            resetPlatform();
+            platformTriggered = false;
+            return;
+        }
 
         if (!isInValidDimension()) {
             resetCounters();
+            resetPlatform();
+            platformTriggered = false;
             return;
         }
 
@@ -246,7 +332,22 @@ public class SafetyNet extends Module {
         double playerY = mc.player.getY();
         boolean belowDisconnect = disconnectEnabled.get() && playerY < effectiveDisconnectY;
         boolean belowWarn = warnEnabled.get() && playerY < effectiveWarnY;
-        boolean inDanger = belowDisconnect || belowWarn;
+        boolean belowPlatformThreshold = platformEnabled.get() && playerY < effectiveWarnY;
+        if (!platformEnabled.get()) {
+            resetPlatform();
+            platformTriggered = false;
+        }
+        if ((belowPlatformThreshold || platformBuilding) && platformEnabled.get()
+            && disconnectOnDamage.get() && damaged && !hasDisconnected) {
+            hasDisconnected = true;
+            resetPlatform();
+            mc.inGameHud.setTitle(Text.literal("§c§lSAFETY NET DISCONNECT"));
+            mc.inGameHud.setSubtitle(Text.literal("§eDamage detected below the warning Y level"));
+            warning("Safety Net disconnected: damage detected below the platform warning Y level.");
+            com.example.addon.utils.MinecraftApiCompat.disconnect(mc);
+            return;
+        }
+        boolean inDanger = belowDisconnect || belowWarn || belowPlatformThreshold;
 
         if (!handleGracePeriod(inDanger)) return;
 
@@ -260,6 +361,14 @@ public class SafetyNet extends Module {
             hasDisconnected = false;
         }
 
+        if (belowPlatformThreshold && !platformTriggered) {
+            platformTriggered = true;
+            if (!platformBuilding) startPlatform();
+        } else if (!belowPlatformThreshold) {
+            platformTriggered = false;
+        }
+        if (platformBuilding) tickPlatform();
+
         if (belowWarn) {
             warnTickCounter++;
             int interval = warnInterval.get();
@@ -271,6 +380,114 @@ public class SafetyNet extends Module {
         } else {
             warnTickCounter = 0;
         }
+    }
+
+    private void startPlatform() {
+        if (mc.interactionManager == null || !mc.player.isAlive()) {
+            warning("Air Place Platform could not start: the player or interaction manager is unavailable.");
+            return;
+        }
+        BlockPos center = mc.player.getBlockPos().down();
+        if (center.getY() < mc.world.getBottomY() || center.getY() >= mc.world.getBottomY() + mc.world.getHeight()) {
+            warning("Air Place Platform cannot place outside the world's build height. Raise the warning Y level.");
+            return;
+        }
+        if (!isPlatformBlockValid(center)) {
+            warning("Air Place Platform needs a solid, non-falling block in hotbar slot %d.", platformSlot.get());
+            return;
+        }
+        platformTargets.clear();
+        for (int x = -2; x <= 2; x++) {
+            for (int z = -2; z <= 2; z++) platformTargets.add(center.add(x, 0, z));
+        }
+        platformTargets.sort(Comparator.comparingInt(pos ->
+            Math.abs(pos.getX() - center.getX()) + Math.abs(pos.getZ() - center.getZ())));
+        platformIndex = 0;
+        platformDelay = 0;
+        platformVerifyTicks = -1;
+        platformRetries = 0;
+        platformBuilding = true;
+        warning("Air Place Platform started; server placement and survival are not guaranteed.");
+    }
+
+    private boolean isPlatformBlockValid(BlockPos pos) {
+        if (!(mc.player.getInventory().getStack(platformSlot.get() - 1).getItem() instanceof BlockItem item)
+            || item.getBlock() instanceof FallingBlock) return false;
+        return item.getBlock().getDefaultState().isFullCube(mc.world, pos);
+    }
+
+    private void tickPlatform() {
+        if (mc.interactionManager == null || !mc.player.isAlive()) {
+            warning("Air Place Platform stopped: the player or interaction manager is unavailable.");
+            resetPlatform();
+            return;
+        }
+        if (platformDelay > 0) {
+            platformDelay--;
+            return;
+        }
+        while (platformIndex < platformTargets.size()) {
+            BlockPos pos = platformTargets.get(platformIndex++);
+            if (!mc.world.getChunkManager().isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) {
+                warning("Air Place Platform stopped: a target chunk is unloaded.");
+                resetPlatform();
+                return;
+            }
+            BlockState state = mc.world.getBlockState(pos);
+            if (!state.isReplaceable()) continue;
+            if (!isPlatformBlockValid(pos)) {
+                warning("Air Place Platform stopped: hotbar slot %d has no suitable blocks.", platformSlot.get());
+                resetPlatform();
+                return;
+            }
+            double reach = mc.player.getBlockInteractionRange();
+            if (mc.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos)) > reach * reach) {
+                warning("Air Place Platform stopped: the remaining blocks are out of reach.");
+                resetPlatform();
+                return;
+            }
+            if (!InvUtils.swap(platformSlot.get() - 1, true)) {
+                warning("Air Place Platform stopped: could not select the configured hotbar slot.");
+                resetPlatform();
+                return;
+            }
+            try {
+                BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+                if (mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit).isAccepted())
+                    mc.player.swingHand(Hand.MAIN_HAND);
+            } finally {
+                InvUtils.swapBack();
+            }
+            platformDelay = 1;
+            return;
+        }
+        if (platformVerifyTicks < 0) {
+            platformVerifyTicks = 5;
+            return;
+        }
+        if (platformVerifyTicks-- > 0) return;
+        long missing = platformTargets.stream().filter(pos ->
+            !mc.world.getChunkManager().isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)
+                || mc.world.getBlockState(pos).isReplaceable()).count();
+        if (missing == 0) {
+            info("Air Place Platform target spaces are occupied.");
+            resetPlatform();
+        } else if (platformRetries++ >= 3) {
+            warning("Air Place Platform stopped with %d missing block(s).", missing);
+            resetPlatform();
+        } else {
+            platformIndex = 0;
+            platformVerifyTicks = -1;
+        }
+    }
+
+    private void resetPlatform() {
+        platformBuilding = false;
+        platformTargets.clear();
+        platformIndex = 0;
+        platformDelay = 0;
+        platformVerifyTicks = -1;
+        platformRetries = 0;
     }
 
     private void handleChorusEscapeKeybind() {

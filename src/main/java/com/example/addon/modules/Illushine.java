@@ -9,6 +9,8 @@ import com.example.addon.Tim;
 import com.example.addon.utils.GlowingRegistry;
 
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.events.world.BlockUpdateEvent;
+import meteordevelopment.meteorclient.events.world.ChunkDataEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.BoolSetting;
@@ -25,6 +27,9 @@ import meteordevelopment.meteorclient.utils.render.WireframeEntityRenderer;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.mob.Angerable;
@@ -35,7 +40,14 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.world.World;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ChunkSection;
 
 public class Illushine extends Module {
 
@@ -135,6 +147,35 @@ public class Illushine extends Module {
     private final SettingGroup sgNeutral   = settings.createGroup("Neutral");
     private final SettingGroup sgHostile   = settings.createGroup("Hostile");
     private final SettingGroup sgPlayer    = settings.createGroup("Player Scale");
+    private final SettingGroup sgBlocks    = settings.createGroup("Block Anomalies");
+
+    private final Setting<Boolean> misrotatedDeepslate = sgBlocks.add(new BoolSetting.Builder()
+        .name("misrotated-deepslate")
+        .description("Highlight horizontally oriented deepslate in the Overworld.")
+        .defaultValue(false)
+        .onChanged(value -> clearDeepslate())
+        .build()
+    );
+
+    private final Setting<Integer> deepslateChunkRadius = sgBlocks.add(new IntSetting.Builder()
+        .name("deepslate-chunk-radius")
+        .description("Loaded chunk radius to scan for misrotated deepslate.")
+        .defaultValue(8).range(1, 16).sliderRange(1, 16)
+        .visible(misrotatedDeepslate::get)
+        .onChanged(value -> clearDeepslate())
+        .build()
+    );
+
+    private final Setting<SettingColor> deepslateColor = sgBlocks.add(new ColorSetting.Builder()
+        .name("misrotated-deepslate-color")
+        .description("Highlight color for misrotated deepslate.")
+        .defaultValue(new SettingColor(0, 180, 255, 255))
+        .visible(misrotatedDeepslate::get)
+        .build()
+    );
+
+    private final Map<ChunkPos, Set<BlockPos>> deepslateByChunk = new HashMap<>();
+    private ClientWorld deepslateWorld;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Settings — General
@@ -328,6 +369,7 @@ public class Illushine extends Module {
     @Override
     public void onActivate() {
         activelyOutlined.clear();
+        clearDeepslate();
     }
 
     @Override
@@ -336,6 +378,7 @@ public class Illushine extends Module {
             GlowingRegistry.remove(id);
         }
         activelyOutlined.clear();
+        clearDeepslate();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -344,7 +387,12 @@ public class Illushine extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Post event) {
-        if (mc.world == null || mc.player == null) return;
+        if (mc.world == null || mc.player == null) {
+            clearDeepslate();
+            return;
+        }
+
+        tickDeepslate();
 
         boolean spectral = highlightMode.get() == HighlightMode.Spectral;
 
@@ -390,7 +438,16 @@ public class Illushine extends Module {
 
     @EventHandler
     private void onRender(Render3DEvent event) {
-        if (mc.world == null || mc.player == null || activelyOutlined.isEmpty()) return;
+        if (mc.world == null || mc.player == null) return;
+
+        if (misrotatedDeepslate.get() && mc.world == deepslateWorld) {
+            SettingColor color = deepslateColor.get();
+            for (Set<BlockPos> positions : deepslateByChunk.values()) {
+                for (BlockPos pos : positions) {
+                    event.renderer.box(pos, withAlpha(color, 25), color, ShapeMode.Both, 0);
+                }
+            }
+        }
 
         boolean wireframe = highlightMode.get() == HighlightMode.Wireframe;
 
@@ -407,6 +464,79 @@ public class Illushine extends Module {
                 );
             }
         }
+    }
+
+    private void clearDeepslate() {
+        deepslateByChunk.clear();
+        deepslateWorld = null;
+    }
+
+    private static boolean isMisrotatedDeepslate(BlockState state) {
+        return state.isOf(Blocks.DEEPSLATE) && state.contains(Properties.AXIS)
+            && state.get(Properties.AXIS) != Direction.Axis.Y;
+    }
+
+    private void tickDeepslate() {
+        if (!misrotatedDeepslate.get() || !mc.world.getRegistryKey().equals(World.OVERWORLD)) {
+            clearDeepslate();
+            return;
+        }
+        if (deepslateWorld != mc.world) {
+            clearDeepslate();
+            deepslateWorld = mc.world;
+        }
+        int centerX = mc.player.getBlockPos().getX() >> 4;
+        int centerZ = mc.player.getBlockPos().getZ() >> 4;
+        int radius = deepslateChunkRadius.get();
+        deepslateByChunk.keySet().removeIf(pos -> Math.abs(pos.x - centerX) > radius
+            || Math.abs(pos.z - centerZ) > radius || !mc.world.getChunkManager().isChunkLoaded(pos.x, pos.z));
+
+        int scanned = 0;
+        for (int d = 0; d <= radius && scanned < 4; d++) {
+            for (int x = -d; x <= d && scanned < 4; x++) {
+                for (int z = -d; z <= d && scanned < 4; z++) {
+                    if (Math.max(Math.abs(x), Math.abs(z)) != d) continue;
+                    ChunkPos pos = new ChunkPos(centerX + x, centerZ + z);
+                    if (deepslateByChunk.containsKey(pos) || !mc.world.getChunkManager().isChunkLoaded(pos.x, pos.z)) continue;
+                    scanDeepslate(mc.world.getChunk(pos.x, pos.z));
+                    scanned++;
+                }
+            }
+        }
+    }
+
+    private void scanDeepslate(Chunk chunk) {
+        Set<BlockPos> matches = new HashSet<>();
+        ChunkPos pos = chunk.getPos();
+        ChunkSection[] sections = chunk.getSectionArray();
+        for (int i = 0; i < sections.length; i++) {
+            ChunkSection section = sections[i];
+            if (section == null || section.isEmpty() || !section.hasAny(Illushine::isMisrotatedDeepslate)) continue;
+            int bottomY = (chunk.getBottomSectionCoord() + i) * 16;
+            for (int x = 0; x < 16; x++) {
+                for (int y = 0; y < 16; y++) {
+                    for (int z = 0; z < 16; z++) {
+                        if (isMisrotatedDeepslate(section.getBlockState(x, y, z)))
+                            matches.add(new BlockPos((pos.x << 4) + x, bottomY + y, (pos.z << 4) + z));
+                    }
+                }
+            }
+        }
+        deepslateByChunk.put(pos, matches);
+    }
+
+    @EventHandler
+    private void onDeepslateBlockUpdate(BlockUpdateEvent event) {
+        if (mc.world != deepslateWorld || deepslateWorld == null) return;
+        Set<BlockPos> matches = deepslateByChunk.get(new ChunkPos(event.pos));
+        if (matches == null) return;
+        if (isMisrotatedDeepslate(event.newState)) matches.add(event.pos.toImmutable());
+        else matches.remove(event.pos);
+    }
+
+    @EventHandler
+    private void onDeepslateChunkData(ChunkDataEvent event) {
+        if (mc.world == deepslateWorld && deepslateWorld != null) deepslateByChunk.remove(event.chunk().getPos());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

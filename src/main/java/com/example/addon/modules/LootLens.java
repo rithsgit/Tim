@@ -3,6 +3,7 @@ package com.example.addon.modules;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -34,6 +35,8 @@ import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.enums.ChestType;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -58,10 +61,10 @@ public class LootLens extends Module {
     private final Set<BlockPos>                   inventoryCheckedContainers = new HashSet<>();
     private final Set<BlockPos>                   scannedByScanner           = new HashSet<>();
     private final Set<BlockPos>                   shulkerContainers          = new HashSet<>();
-    private final Map<BlockPos, Integer>          shulkerCounts              = new HashMap<>();
+    private final Map<BlockPos, LootCounts>       checkedLootCounts           = new HashMap<>();
 
     private BlockPos lastOpenedContainer    = null;
-    private boolean  screenInventoryChecked = false;
+    private boolean shulkerSummarySent = false;
 
     private String lastDimension = "";
     private static final int DIMENSION_CHANGE_COOLDOWN_TICKS = 40;
@@ -89,6 +92,14 @@ public class LootLens extends Module {
     private final Setting<List<Item>> customItems = sgGeneral.add(new ItemListSetting.Builder()
         .name("custom-items").description("Additional items to highlight in containers.")
         .defaultValue(List.of(Items.ENCHANTED_GOLDEN_APPLE, Items.ELYTRA)).build()
+    );
+
+    private final Setting<Boolean> ignoreEmptyShulkers = sgGeneral.add(new BoolSetting.Builder()
+        .name("ignore-empty-shulkers")
+        .description("Ignore empty shulker items found inside containers.")
+        .defaultValue(true)
+        .onChanged(ignored -> refreshCheckedLoot())
+        .build()
     );
 
     private final Setting<Boolean> stealDumpButtons = sgGeneral.add(new BoolSetting.Builder()
@@ -320,8 +331,8 @@ public class LootLens extends Module {
 
     private void clearAllState() {
         containers.clear(); inventoryCheckedContainers.clear(); scannedByScanner.clear();
-        shulkerContainers.clear(); shulkerCounts.clear();
-        lastOpenedContainer = null; screenInventoryChecked = false; cleanupTimer = 0;
+        shulkerContainers.clear(); checkedLootCounts.clear();
+        lastOpenedContainer = null; shulkerSummarySent = false; cleanupTimer = 0;
     }
 
     @EventHandler
@@ -346,29 +357,30 @@ public class LootLens extends Module {
         if (mc.player == null || mc.world == null) return;
         if (mc.currentScreen instanceof HandledScreen<?>
                 && !(mc.currentScreen instanceof InventoryScreen)
-                && lastOpenedContainer != null && !screenInventoryChecked) {
+                && lastOpenedContainer != null) {
             HandledScreen<?> screen = (HandledScreen<?>) mc.currentScreen;
-            if (containers.containsKey(lastOpenedContainer) || shulkerContainers.contains(lastOpenedContainer)) {
-                checkScreenInventoryForShulkers(screen); screenInventoryChecked = true;
+            if (containers.containsKey(lastOpenedContainer) || shulkerContainers.contains(lastOpenedContainer)
+                    || inventoryCheckedContainers.contains(lastOpenedContainer)) {
+                checkScreenInventoryForShulkers(screen);
             }
         }
         if (mc.currentScreen == null && lastOpenedContainer != null) {
-            lastOpenedContainer = null; screenInventoryChecked = false;
+            lastOpenedContainer = null;
+            shulkerSummarySent = false;
         }
     }
 
     @EventHandler
     private void onOpenScreen(OpenScreenEvent event) {
         if (mc.player == null || mc.world == null) return;
-        screenInventoryChecked = false;
         if (event.screen instanceof InventoryScreen) return;
+        shulkerSummarySent = false;
         HitResult hitResult = mc.crosshairTarget;
         if (hitResult != null && hitResult.getType() == HitResult.Type.BLOCK)
             lastOpenedContainer = ((BlockHitResult) hitResult).getBlockPos();
     }
 
-    public void setLastInteractedPos(BlockPos pos) { lastOpenedContainer = pos; screenInventoryChecked = false; }
-    public void onOpenScreenPacket() { screenInventoryChecked = false; }
+    public void setLastInteractedPos(BlockPos pos) { lastOpenedContainer = pos; }
 
     private boolean isImmediateHighlight(StorageType type) {
         return switch (type) {
@@ -377,18 +389,42 @@ public class LootLens extends Module {
         };
     }
 
+    private void refreshCheckedLoot() {
+        for (Map.Entry<BlockPos, LootCounts> entry : checkedLootCounts.entrySet()) {
+            int count = ignoreEmptyShulkers.get() ? entry.getValue().nonEmpty() : entry.getValue().all();
+            if (count > 0) shulkerContainers.add(entry.getKey());
+            else shulkerContainers.remove(entry.getKey());
+        }
+    }
+
     private void checkScreenInventoryForShulkers(HandledScreen<?> screen) {
         if (lastOpenedContainer == null) return;
         if (mc.world != null && mc.world.getBlockState(lastOpenedContainer).getBlock() == Blocks.ENDER_CHEST) return;
         ScreenHandler handler    = screen.getScreenHandler();
         int playerInventoryStart = handler.slots.size() - 36;
         int shulkerCount         = 0;
+        int nonEmptyCount        = 0;
+        Map<String, Integer> contentsSummary = new LinkedHashMap<>();
         boolean previouslyHad    = shulkerContainers.contains(lastOpenedContainer);
         for (int i = 0; i < playerInventoryStart; i++) {
             Slot slot = handler.slots.get(i); ItemStack stack = slot.getStack();
             if (stack.isEmpty()) continue;
             boolean isShulker = stack.getItem() instanceof BlockItem bi && bi.getBlock() instanceof ShulkerBoxBlock;
-            if (isShulker || customItems.get().contains(stack.getItem())) shulkerCount++;
+            if (isShulker) {
+                shulkerCount++;
+                ContainerComponent contents = stack.get(DataComponentTypes.CONTAINER);
+                if (contents != null) {
+                    boolean hasContents = false;
+                    for (ItemStack item : contents.iterateNonEmpty()) {
+                        hasContents = true;
+                        contentsSummary.merge(item.getName().getString(), item.getCount(), Integer::sum);
+                    }
+                    if (hasContents) nonEmptyCount++;
+                }
+            } else if (customItems.get().contains(stack.getItem())) {
+                shulkerCount++;
+                nonEmptyCount++;
+            }
         }
         StorageType type = containers.get(lastOpenedContainer);
         if (type != null && isImmediateHighlight(type)) return;
@@ -398,10 +434,13 @@ public class LootLens extends Module {
         BlockPos adjacentChest = findAdjacentChest(lastOpenedContainer, false);
         if (adjacentChest != null) inventoryCheckedContainers.add(adjacentChest);
 
+        LootCounts counts = new LootCounts(shulkerCount, nonEmptyCount);
+        checkedLootCounts.put(lastOpenedContainer, counts);
+        if (adjacentChest != null) checkedLootCounts.put(adjacentChest, counts);
+        shulkerCount = ignoreEmptyShulkers.get() ? nonEmptyCount : shulkerCount;
         if (shulkerCount > 0) {
             shulkerContainers.add(lastOpenedContainer);
-            shulkerCounts.put(lastOpenedContainer, shulkerCount);
-            if (adjacentChest != null) { shulkerContainers.add(adjacentChest); shulkerCounts.put(adjacentChest, shulkerCount); }
+            if (adjacentChest != null) shulkerContainers.add(adjacentChest);
             if (!previouslyHad && notification.get()) {
                 mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
                 info("%d %s found!", shulkerCount, shulkerCount == 1 ? "item" : "items");
@@ -409,9 +448,19 @@ public class LootLens extends Module {
         } else {
             containers.remove(lastOpenedContainer);
             shulkerContainers.remove(lastOpenedContainer);
-            shulkerCounts.remove(lastOpenedContainer);
-            if (adjacentChest != null) { containers.remove(adjacentChest); shulkerContainers.remove(adjacentChest); shulkerCounts.remove(adjacentChest); }
+            if (adjacentChest != null) { containers.remove(adjacentChest); shulkerContainers.remove(adjacentChest); }
             if (previouslyHad && notification.get()) info("0 items found, removing highlight.");
+        }
+        if (!shulkerSummarySent && notification.get() && !contentsSummary.isEmpty()) {
+            List<String> entries = new ArrayList<>();
+            for (Map.Entry<String, Integer> entry : contentsSummary.entrySet()) {
+                if (entries.size() == 5) break;
+                entries.add(entry.getValue() + "x " + entry.getKey());
+            }
+            int remaining = contentsSummary.size() - entries.size();
+            info("Shulker contents: %s%s", String.join(", ", entries),
+                remaining > 0 ? " (+" + remaining + " more)" : "");
+            shulkerSummarySent = true;
         }
     }
 
@@ -485,7 +534,7 @@ public class LootLens extends Module {
             if (entry.getValue() != type) return false;
             BlockPos pos = entry.getKey();
             inventoryCheckedContainers.remove(pos); scannedByScanner.remove(pos);
-            shulkerContainers.remove(pos); shulkerCounts.remove(pos);
+            shulkerContainers.remove(pos); checkedLootCounts.remove(pos);
             return true;
         });
     }
@@ -500,9 +549,13 @@ public class LootLens extends Module {
             if (entry.getKey().getSquaredDistance(playerPos) <= cleanupRangeSq) return false;
             BlockPos pos = entry.getKey();
             inventoryCheckedContainers.remove(pos); scannedByScanner.remove(pos);
-            shulkerContainers.remove(pos); shulkerCounts.remove(pos);
+            shulkerContainers.remove(pos); checkedLootCounts.remove(pos);
             return true;
         });
+        checkedLootCounts.keySet().removeIf(pos -> pos.getSquaredDistance(playerPos) > cleanupRangeSq);
+        inventoryCheckedContainers.removeIf(pos -> pos.getSquaredDistance(playerPos) > cleanupRangeSq);
+        scannedByScanner.removeIf(pos -> pos.getSquaredDistance(playerPos) > cleanupRangeSq);
+        shulkerContainers.removeIf(pos -> pos.getSquaredDistance(playerPos) > cleanupRangeSq);
     }
 
     @EventHandler
@@ -565,7 +618,7 @@ public class LootLens extends Module {
             for (BlockPos removePos : toRemove) {
                 containers.remove(removePos); inventoryCheckedContainers.remove(removePos);
                 scannedByScanner.remove(removePos); shulkerContainers.remove(removePos);
-                shulkerCounts.remove(removePos);
+                checkedLootCounts.remove(removePos);
             }
         }
     }
@@ -798,6 +851,8 @@ public class LootLens extends Module {
             if (type == StorageType.ENDER_CHEST) count++;
         return count;
     }
+
+    private record LootCounts(int all, int nonEmpty) {}
 
     private enum StorageType {
         CHEST, TRAPPED_CHEST, BARREL, SHULKER_BOX, ENDER_CHEST,
