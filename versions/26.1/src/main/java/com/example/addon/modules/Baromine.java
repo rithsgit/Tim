@@ -96,19 +96,11 @@ public class Baromine extends Module {
     private final SettingGroup sgNotifications = settings.createGroup("Notifications");
 
     // --- MULTI-VERSION REGISTRY HELPERS (1.21.4 - 1.21.11) ---
-    /**
-     * Resolves a block by its vanilla ID if present in the running version (e.g. 1.21.5 - 1.21.11),
-     * or returns null (sits idle) when running on an older version like 1.21.4.
-     */
     private static Block optBlock(String path) {
         Identifier id = Identifier.withDefaultNamespace(path);
         return BuiltInRegistries.BLOCK.containsKey(id) ? BuiltInRegistries.BLOCK.getValue(id) : null;
     }
 
-    /**
-     * Resolves an item by its vanilla ID if present in the running version (e.g. 1.21.5 - 1.21.11),
-     * or returns null (sits idle) when running on an older version like 1.21.4.
-     */
     private static Item optItem(String path) {
         Identifier id = Identifier.withDefaultNamespace(path);
         return BuiltInRegistries.ITEM.containsKey(id) ? BuiltInRegistries.ITEM.getValue(id) : null;
@@ -220,7 +212,7 @@ public class Baromine extends Module {
 
     private final Setting<Boolean> pauseInCombat = sgSafety.add(new BoolSetting.Builder()
         .name("pause-in-combat")
-        .description("Pauses Baromine if a hostile mob is within 5 blocks.")
+        .description("Briefly pauses for a visible attacking mob within melee range, then resumes if combat stalls.")
         .defaultValue(true)
         .build()
     );
@@ -262,7 +254,7 @@ public class Baromine extends Module {
 
     private final Setting<Boolean> avoidDeepDark = sgSafety.add(new BoolSetting.Builder()
         .name("avoid-deep-dark")
-        .description("Uses a tactical #goto retreat if you enter the Deep Dark biome.")
+        .description("Retreats if you enter the Deep Dark biome.")
         .defaultValue(true)
         .build()
     );
@@ -515,6 +507,9 @@ public class Baromine extends Module {
 
     // --- VARIABLES ---
     private boolean wasPausedForCombat = false;
+    private int combatPauseTicks = 0;
+    private int combatCooldownTicks = 0;
+    private int navigationRetryTicks = 0;
     private boolean hasHealthWarned = false;
     private boolean playerLogoutPending = false;
     private boolean isFinalDeposit = false;
@@ -537,6 +532,14 @@ public class Baromine extends Module {
 
     private boolean shulkerRecoveryAttempted = false;
     private int pickupTimeout = 0;
+    private Item placedShulkerItem;
+    private int shulkerCountBeforePickup;
+    private ItemStack recoveredShulker = ItemStack.EMPTY;
+    private final List<ItemStack> inventoryBeforeShulkerPickup = new ArrayList<>();
+    private boolean shulkerPickupSnapshotTaken;
+    private int transferSlot = -1;
+    private int transferCount;
+    private boolean depositTransferFailed;
 
     private boolean isHandlingLava = false;
     private int lavaSafetyDelay = 0;
@@ -638,6 +641,10 @@ public class Baromine extends Module {
     @Override
     public void onActivate() {
         wasPausedForCombat = false;
+        combatPauseTicks = 0;
+        combatCooldownTicks = 0;
+        navigationRetryTicks = 0;
+        depositTransferFailed = false;
         hasHealthWarned = false;
         playerLogoutPending = false;
         isFinalDeposit = false;
@@ -691,10 +698,8 @@ public class Baromine extends Module {
             mc.options.keyJump.setDown(false);
             mc.options.keyUp.setDown(false);
         }
-        if (BaritoneAPI.getProvider().getPrimaryBaritone().getPathingBehavior().isPathing()) {
-            if (!Modules.get().isActive(PortalMaker.class)) {
-                BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("stop");
-            }
+        if (!Modules.get().isActive(PortalMaker.class)) {
+            BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("stop");
         }
         BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("set okIfWater false");
         sendPing("Baromine deactivated.");
@@ -728,7 +733,6 @@ public class Baromine extends Module {
 
         if (mc.player == null || mc.level == null) return;
 
-        // Yield Baritone control to PortalMaker if it is active
         if (Modules.get().isActive(PortalMaker.class)) {
             if (!wasPausedForPortalMaker) {
                 wasPausedForPortalMaker = true;
@@ -997,32 +1001,45 @@ public class Baromine extends Module {
             }
         }
 
-        // Compatible across 1.21.4 - 1.21.11 (replaces removed getArmorStack(3))
         if (goldenHelmet.get() && mc.player.getItemBySlot(EquipmentSlot.HEAD).getItem() != Items.GOLDEN_HELMET) {
             stopBaritoneSafely("Golden Helmet is not equipped!");
             return;
         }
 
+        if (combatCooldownTicks > 0) combatCooldownTicks--;
         if (pauseInCombat.get()) {
             boolean inDanger = false;
             for (Entity entity : mc.level.entitiesForRendering()) {
-                if (entity instanceof Mob mob && mob.isAggressive() && mc.player.distanceTo(mob) < 6.0) {
+                if (entity instanceof Mob mob && mob.isAggressive() && mc.player.distanceTo(mob) < 3.0 && mc.player.hasLineOfSight(mob)) {
                     inDanger = true;
                     break;
                 }
             }
 
-            if (inDanger && !wasPausedForCombat) {
+            if (inDanger && !wasPausedForCombat && combatCooldownTicks == 0) {
                 stopBaritoneSafely("Hostile entity detected! Pausing.");
                 equipSword();
                 wasPausedForCombat = true;
-                return;
+                combatPauseTicks = 0;
             } else if (!inDanger && wasPausedForCombat) {
                 sendPing("Combat clear. Resuming Baromine.");
                 wasPausedForCombat = false;
                 updateBaritoneGoal();
             }
+            if (wasPausedForCombat && ++combatPauseTicks >= 100) {
+                sendPing("Combat stalled. Resuming mining.");
+                wasPausedForCombat = false;
+                combatCooldownTicks = 200;
+                updateBaritoneGoal();
+            }
+        } else if (wasPausedForCombat) {
+            wasPausedForCombat = false;
+            updateBaritoneGoal();
         }
+        if (wasPausedForCombat) return;
+
+        if (navigationRetryTicks > 0) navigationRetryTicks--;
+        if (navigationRetryTicks == 0 && isBaritoneIdle()) updateBaritoneGoal();
 
         if (antiAfk.get()) {
             antiAfkTickCounter++;
@@ -1065,7 +1082,6 @@ public class Baromine extends Module {
 
         if (total <= 64) return;
 
-        // Drop from main inventory first (slots 9-35), then hotbar (0-8)
         int[] order = new int[36];
         for (int i = 9; i < 36; i++) order[i - 9] = i;
         for (int i = 0; i < 9; i++) order[27 + i] = i;
@@ -1078,13 +1094,12 @@ public class Baromine extends Module {
                 if (total - count >= 64) {
                     int containerSlot = slot < 9 ? slot + 36 : slot;
                     mc.gameMode.handleContainerInput(mc.player.containerMenu.containerId, containerSlot, 1, ContainerInput.THROW, mc.player);
-                    return; // Do one drop per tick to avoid packet spam
+                    return;
                 }
             }
         }
     }
 
-    // --- DEEP DARK RETREAT LOGIC ---
     private void triggerDeepDarkRetreat() {
         sendPing("Entered Deep Dark biome! Initiating tactical retreat.");
         deepDarkState = DeepDarkState.RETREATING;
@@ -1153,7 +1168,6 @@ public class Baromine extends Module {
         deepDarkState = DeepDarkState.RUNNING_AWAY;
     }
 
-    // --- AUTO CRAFT LOGIC ---
     private void handleCraftState() {
         if (craftDelay > 0) {
             craftDelay--;
@@ -1554,10 +1568,9 @@ public class Baromine extends Module {
         int[] grid9 = new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9};
         int[] grid4 = new int[]{1, 2, 4, 5};
         int[] grid3Bottom = new int[]{7, 8, 9};
-        int[] grid6Top = new int[]{1, 2, 3, 4, 5, 6}; // For walls, iron/copper bars, glass panes
-        int[] grid6Stairs = new int[]{1, 4, 5, 7, 8, 9}; // For stairs
+        int[] grid6Top = new int[]{1, 2, 3, 4, 5, 6};
+        int[] grid6Stairs = new int[]{1, 4, 5, 7, 8, 9};
 
-        // Stone & Deepslate Variants
         if (block == Blocks.STONE_BRICKS) return new CraftRecipe(Items.STONE, 4, grid4);
         if (block == Blocks.POLISHED_GRANITE) return new CraftRecipe(Items.GRANITE, 4, grid4);
         if (block == Blocks.POLISHED_DIORITE) return new CraftRecipe(Items.DIORITE, 4, grid4);
@@ -1568,14 +1581,12 @@ public class Baromine extends Module {
         if (block == Blocks.END_STONE_BRICKS) return new CraftRecipe(Items.END_STONE, 4, grid4);
         if (block == Blocks.MUD_BRICKS) return new CraftRecipe(Items.PACKED_MUD, 4, grid4);
 
-        // Nether Variants
         if (block == Blocks.NETHER_BRICKS) return new CraftRecipe(Items.NETHER_BRICK, 4, grid4);
         if (block == Blocks.QUARTZ_BRICKS) return new CraftRecipe(Items.QUARTZ_BLOCK, 4, grid4);
         if (block == Blocks.POLISHED_BASALT) return new CraftRecipe(Items.BASALT, 4, grid4);
         if (block == Blocks.POLISHED_BLACKSTONE) return new CraftRecipe(Items.BLACKSTONE, 4, grid4);
         if (block == Blocks.POLISHED_BLACKSTONE_BRICKS) return new CraftRecipe(Items.BLACKSTONE, 4, grid4);
 
-        // Sands, Clays & Resin (1.21.4+)
         if (block == Blocks.SANDSTONE) return new CraftRecipe(Items.SAND, 4, grid4);
         if (block == Blocks.RED_SANDSTONE) return new CraftRecipe(Items.RED_SAND, 4, grid4);
         if (block == Blocks.CUT_SANDSTONE) return new CraftRecipe(Items.SANDSTONE, 4, grid4);
@@ -1584,7 +1595,6 @@ public class Baromine extends Module {
         if (block == Blocks.RESIN_BLOCK) return new CraftRecipe(Items.RESIN_CLUMP, 9, grid9);
         if (block == Blocks.RESIN_BRICKS) return new CraftRecipe(Items.RESIN_BRICK, 4, grid4);
 
-        // Nature & Misc
         if (block == Blocks.SNOW_BLOCK) return new CraftRecipe(Items.SNOWBALL, 4, grid4);
         if (block == Blocks.GLOWSTONE) return new CraftRecipe(Items.GLOWSTONE_DUST, 4, grid4);
         if (block == Blocks.MELON) return new CraftRecipe(Items.MELON_SLICE, 9, grid9);
@@ -1595,11 +1605,9 @@ public class Baromine extends Module {
         if (block == Blocks.PACKED_ICE) return new CraftRecipe(Items.ICE, 9, grid9);
         if (block == Blocks.BLUE_ICE) return new CraftRecipe(Items.PACKED_ICE, 9, grid9);
 
-        // Bars & Panes
         if (block == Blocks.IRON_BARS) return new CraftRecipe(Items.IRON_INGOT, 6, grid6Top);
         if (block == Blocks.GLASS_PANE) return new CraftRecipe(Items.GLASS, 6, grid6Top);
 
-        // Slabs
         if (block == Blocks.STONE_SLAB) return new CraftRecipe(Items.STONE, 3, grid3Bottom);
         if (block == Blocks.COBBLESTONE_SLAB) return new CraftRecipe(Items.COBBLESTONE, 3, grid3Bottom);
         if (block == Blocks.STONE_BRICK_SLAB) return new CraftRecipe(Items.STONE_BRICKS, 3, grid3Bottom);
@@ -1630,7 +1638,6 @@ public class Baromine extends Module {
         if (block == Blocks.CHERRY_SLAB) return new CraftRecipe(Items.CHERRY_PLANKS, 3, grid3Bottom);
         if (block == Blocks.PALE_OAK_SLAB) return new CraftRecipe(Items.PALE_OAK_PLANKS, 3, grid3Bottom);
 
-        // Stairs
         if (block == Blocks.STONE_STAIRS) return new CraftRecipe(Items.STONE, 6, grid6Stairs);
         if (block == Blocks.COBBLESTONE_STAIRS) return new CraftRecipe(Items.COBBLESTONE, 6, grid6Stairs);
         if (block == Blocks.STONE_BRICK_STAIRS) return new CraftRecipe(Items.STONE_BRICKS, 6, grid6Stairs);
@@ -1664,7 +1671,6 @@ public class Baromine extends Module {
         if (block == Blocks.CHERRY_STAIRS) return new CraftRecipe(Items.CHERRY_PLANKS, 6, grid6Stairs);
         if (block == Blocks.PALE_OAK_STAIRS) return new CraftRecipe(Items.PALE_OAK_PLANKS, 6, grid6Stairs);
 
-        // Walls
         if (block == Blocks.COBBLESTONE_WALL) return new CraftRecipe(Items.COBBLESTONE, 6, grid6Top);
         if (block == Blocks.STONE_BRICK_WALL) return new CraftRecipe(Items.STONE_BRICKS, 6, grid6Top);
         if (block == Blocks.SANDSTONE_WALL) return new CraftRecipe(Items.SANDSTONE, 6, grid6Top);
@@ -1684,7 +1690,6 @@ public class Baromine extends Module {
         if (block == Blocks.MUD_BRICK_WALL) return new CraftRecipe(Items.MUD_BRICKS, 6, grid6Top);
         if (block == Blocks.RESIN_BRICK_WALL) return new CraftRecipe(Items.RESIN_BRICKS, 6, grid6Top);
 
-        // 1.21.5 - 1.21.11 Blocks (active on 1.21.6+/1.21.9+, sit idle on 1.21.4)
         Block copperBars = optBlock("copper_bars");
         if (copperBars != null && block == copperBars) return new CraftRecipe(Items.COPPER_INGOT, 6, grid6Top);
 
@@ -1733,7 +1738,6 @@ public class Baromine extends Module {
         updateBaritoneGoal();
     }
 
-    // --- SAFE HIDEOUT LOGIC ---
     private boolean isInNetherOrOverworld() {
         if (mc.level == null) return false;
         return mc.level.dimension().equals(Level.OVERWORLD) || mc.level.dimension().equals(Level.NETHER);
@@ -1761,7 +1765,7 @@ public class Baromine extends Module {
                     for (Direction d : dirs) {
                         BlockPos feet = mc.player.blockPosition().relative(d);
                         BlockPos head = feet.above();
-                        if (!mc.level.isEmptyBlock(feet) && !mc.level.isEmptyBlock(head) && mc.level.getBlockState(feet).getBlock().defaultDestroyTime() > 0 && mc.level.getBlockState(head).getBlock().defaultDestroyTime() > 0) {
+                        if (!mc.level.isEmptyBlock(feet) && !mc.level.isEmptyBlock(head) && mc.level.getBlockState(feet).getDestroySpeed(mc.level, feet) > 0 && mc.level.getBlockState(head).getDestroySpeed(mc.level, head) > 0) {
                             hideoutDir = d;
                             hideoutPos = feet;
                             break;
@@ -1830,7 +1834,6 @@ public class Baromine extends Module {
         }
     }
 
-    // --- NATIVE AUTO-MEND LOGIC ---
     private void startAutoMend() {
         isAutoMending = true;
         savedTargetBlock = getTargetBlock();
@@ -1912,7 +1915,7 @@ public class Baromine extends Module {
             needsOffhandSwap = true;
         } else if (getDurabilityPercent(offHand) >= maxMendDurability.get()) {
             if (findMostDamagedNonSilkTool(mainHandSlot) != -1) {
-                needsOffhandSwap = true;
+                needsSwap = true;
             }
         }
 
@@ -1973,7 +1976,6 @@ public class Baromine extends Module {
         return (double)(stack.getMaxDamage() - stack.getDamageValue()) / stack.getMaxDamage() * 100.0;
     }
 
-    // --- DEPOSIT STATE MACHINE LOGIC ---
     private void handleDepositState() {
         if (depositDelay > 0) {
             depositDelay--;
@@ -2003,7 +2005,7 @@ public class Baromine extends Module {
                     spaceClearingStarted = true;
                     sendPing("Clearing 2x2 area with Baritone...");
                     spaceClearAttempts = 0;
-                    spaceClearMinWait = 40; // 2 seconds minimum wait
+                    spaceClearMinWait = 40;
 
                     BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("sel pos1 ~-1 ~ ~-1");
                     BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("sel pos2 ~1 ~1 ~1");
@@ -2107,8 +2109,8 @@ public class Baromine extends Module {
 
                 if (shulkerSlot == -1) {
                     mc.player.closeContainer();
-                    sendPing("All Shulker Boxes are completely full! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("No available Shulker Boxes in the Ender Chest; stopping with items still in inventory.");
+                    toggle();
                     return;
                 }
 
@@ -2136,11 +2138,13 @@ public class Baromine extends Module {
                 }
 
                 if (shulkerInvSlot == -1) {
-                    sendPing("No valid Shulker Boxes found! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("No available Shulker Boxes found; stopping with items still in inventory.");
+                    toggle();
                     return;
                 }
 
+                ItemStack selectedShulker = mc.player.getInventory().getItem(shulkerInvSlot).copy();
+                placedShulkerItem = selectedShulker.getItem();
                 if (shulkerInvSlot >= 9) {
                     int targetSlot = swapSlot.get();
                     InvUtils.move().from(shulkerInvSlot).toHotbar(targetSlot);
@@ -2151,7 +2155,7 @@ public class Baromine extends Module {
 
                 BlockPos placeExclude = (depositMode.get() == DepositMode.EnderChest) ? echestPos : null;
                 BlockPos placeExcludeUp = (depositMode.get() == DepositMode.EnderChest) ? echestPos.above() : null;
-                shulkerPos = findAndPlace(InvUtils.findInHotbar(SHULKER_PREDICATE), placeExclude, placeExcludeUp);
+                shulkerPos = findAndPlace(InvUtils.findInHotbar(stack -> ItemStack.matches(stack, selectedShulker)), placeExclude, placeExcludeUp);
 
                 if (shulkerPos == null) {
                     spaceClearAttempts++;
@@ -2167,6 +2171,7 @@ public class Baromine extends Module {
                 }
 
                 spaceClearAttempts = 0;
+                transferSlot = -1;
                 depositState = DepositState.OPENING_SHULKER;
                 depositDelay = 5;
                 break;
@@ -2192,18 +2197,29 @@ public class Baromine extends Module {
                         depositState = DepositState.MINING_SURROUNDINGS_SHULKER;
                         depositDelay = 5;
                     } else {
-                        sendPing("Failed to open Shulker Box even after clearing space. Resuming mining.");
-                        depositState = DepositState.RESUMING;
+                        sendPing("Failed to open the placed Shulker Box. Stopping; recover it manually.");
+                        toggle();
                     }
                     return;
                 }
 
                 ShulkerBoxMenu shulkerHandler = (ShulkerBoxMenu) mc.player.containerMenu;
 
+                if (transferSlot >= 0 && shulkerHandler.getSlot(transferSlot).getItem().getCount() >= transferCount) {
+                    sendPing("Shulker transfer did not complete; closing and recovering the box.");
+                    depositTransferFailed = true;
+                    transferSlot = -1;
+                    depositState = DepositState.CLOSING_SHULKER;
+                    depositDelay = 2;
+                    break;
+                }
+                transferSlot = -1;
                 boolean moved = false;
                 for (int i = 27; i < shulkerHandler.slots.size(); i++) {
                     ItemStack stack = shulkerHandler.getSlot(i).getItem();
-                    if (validItems.contains(stack.getItem())) {
+                    if (validItems.contains(stack.getItem()) && hasShulkerSpace(shulkerHandler, stack)) {
+                        transferSlot = i;
+                        transferCount = stack.getCount();
                         mc.gameMode.handleContainerInput(shulkerHandler.containerId, i, 0, ContainerInput.QUICK_MOVE, mc.player);
                         moved = true;
                         break;
@@ -2235,15 +2251,24 @@ public class Baromine extends Module {
 
             case CLOSING_SHULKER:
                 mc.player.closeContainer();
+                shulkerPickupSnapshotTaken = false;
                 depositState = DepositState.BREAKING_SHULKER;
                 depositDelay = 5;
                 break;
 
             case BREAKING_SHULKER:
                 if (!equipEnchantedPickaxe()) {
-                    sendPing("No " + toolEnchant.get() + " Pickaxe found! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("No " + toolEnchant.get() + " Pickaxe found! Stopping; recover the placed Shulker Box manually.");
+                    toggle();
                     return;
+                }
+
+                if (!shulkerPickupSnapshotTaken) {
+                    shulkerCountBeforePickup = countInventoryItem(placedShulkerItem);
+                    inventoryBeforeShulkerPickup.clear();
+                    for (int i = 0; i < 36; i++) inventoryBeforeShulkerPickup.add(mc.player.getInventory().getItem(i).copy());
+                    recoveredShulker = ItemStack.EMPTY;
+                    shulkerPickupSnapshotTaken = true;
                 }
 
                 if (mc.level.getBlockState(shulkerPos).getBlock() instanceof ShulkerBoxBlock) {
@@ -2258,7 +2283,14 @@ public class Baromine extends Module {
                 break;
 
             case PICKING_UP_SHULKER:
-                if (InvUtils.find(SHULKER_PREDICATE).found()) {
+                if (countInventoryItem(placedShulkerItem) > shulkerCountBeforePickup) {
+                    for (int i = 0; i < 36; i++) {
+                        ItemStack stack = mc.player.getInventory().getItem(i);
+                        if (stack.getItem() == placedShulkerItem && !ItemStack.matches(stack, inventoryBeforeShulkerPickup.get(i))) {
+                            recoveredShulker = stack.copy();
+                            break;
+                        }
+                    }
                     mc.options.keyUp.setDown(false);
                     mc.options.keyJump.setDown(false);
                     mc.options.keyLeft.setDown(false);
@@ -2283,7 +2315,7 @@ public class Baromine extends Module {
                 double closestShulkerDist = 8.0;
                 boolean shulkerExists = false;
                 for (Entity entity : mc.level.entitiesForRendering()) {
-                    if (entity instanceof ItemEntity itemEntity && SHULKER_PREDICATE.test(itemEntity.getItem())) {
+                    if (entity instanceof ItemEntity itemEntity && itemEntity.getItem().getItem() == placedShulkerItem && itemEntity.blockPosition().distSqr(shulkerPos) < 64) {
                         double dist = mc.player.distanceTo(entity);
                         if (dist < 32.0) shulkerExists = true;
                         if (dist < closestShulkerDist) {
@@ -2291,6 +2323,14 @@ public class Baromine extends Module {
                             targetShulker = itemEntity;
                         }
                     }
+                }
+
+                if (++pickupTimeout > 200) {
+                    mc.options.keyUp.setDown(false);
+                    mc.options.keyJump.setDown(false);
+                    sendPing("Failed to recover the Shulker Box. Stopping to avoid losing its contents.");
+                    toggle();
+                    return;
                 }
 
                 if (targetShulker != null) {
@@ -2309,7 +2349,8 @@ public class Baromine extends Module {
 
                     depositDelay = 1;
                 } else {
-                    pickupTimeout++;
+                    mc.options.keyUp.setDown(false);
+                    mc.options.keyJump.setDown(false);
                     if (pickupTimeout > 100) {
                         mc.options.keyUp.setDown(false);
                         mc.options.keyJump.setDown(false);
@@ -2320,14 +2361,12 @@ public class Baromine extends Module {
                             return;
                         }
 
-                        if ((isFinalDeposit || safeLogout.get()) && shulkerExists) {
-                            sendPing("Waiting for Shulker Box to drop or come into range...");
-                            pickupTimeout = 0;
-                            depositDelay = 10;
-                        } else {
-                            sendPing("Lost Shulker Box after mining it! Resuming mining.");
-                            depositState = DepositState.RESUMING;
+                        if (!shulkerExists) {
+                            sendPing("Shulker Box drop not found. Stopping to avoid losing its contents.");
+                            toggle();
+                            return;
                         }
+                        depositDelay = 10;
                     } else {
                         depositDelay = 1;
                     }
@@ -2336,8 +2375,8 @@ public class Baromine extends Module {
 
             case REOPENING_ECHEST:
                 if (mc.level.getBlockState(echestPos).getBlock() != Blocks.ENDER_CHEST) {
-                    sendPing("Ender Chest disappeared before reopening! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("Ender Chest disappeared before reopening; stopping with the Shulker Box in inventory.");
+                    toggle();
                     return;
                 }
                 BlockHitResult echestHit2 = new BlockHitResult(Vec3.atCenterOf(echestPos), Direction.UP, echestPos, false);
@@ -2349,15 +2388,15 @@ public class Baromine extends Module {
 
             case DEPOSITING_SHULKER:
                 if (!(mc.player.containerMenu instanceof ChestMenu)) {
-                    sendPing("Failed to reopen Ender Chest. Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("Failed to reopen Ender Chest; stopping with the Shulker Box in inventory.");
+                    toggle();
                     return;
                 }
                 ChestMenu echestHandler2 = (ChestMenu) mc.player.containerMenu;
                 int shulkerReturnSlot = -1;
 
                 for (int i = 27; i < echestHandler2.slots.size(); i++) {
-                    if (SHULKER_PREDICATE.test(echestHandler2.getSlot(i).getItem())) {
+                    if (!recoveredShulker.isEmpty() && ItemStack.matches(recoveredShulker, echestHandler2.getSlot(i).getItem())) {
                         shulkerReturnSlot = i;
                         break;
                     }
@@ -2365,8 +2404,8 @@ public class Baromine extends Module {
 
                 if (shulkerReturnSlot == -1) {
                     mc.player.closeContainer();
-                    sendPing("Lost Shulker Box after mining it! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("Recovered Shulker Box no longer found in inventory; stopping.");
+                    toggle();
                     return;
                 }
 
@@ -2385,8 +2424,8 @@ public class Baromine extends Module {
 
                 if (!placed) {
                     mc.player.closeContainer();
-                    sendPing("Ender Chest is completely full! Resuming mining.");
-                    depositState = DepositState.RESUMING;
+                    sendPing("Ender Chest is full; stopping with the Shulker Box in inventory.");
+                    toggle();
                     return;
                 }
 
@@ -2584,7 +2623,13 @@ public class Baromine extends Module {
                 ensureToolsInHotbar();
                 depositState = DepositState.IDLE;
 
-                if (isFinalDeposit) {
+                if (depositTransferFailed) {
+                    sendPing("Deposit failed; stopping with remaining items in inventory.");
+                    toggle();
+                } else if (isFinalDeposit && getCurrentTargetCount() > 0) {
+                    depositState = DepositState.PAUSING_BARITONE;
+                    depositDelay = 5;
+                } else if (isFinalDeposit) {
                     isFinalDeposit = false;
                     sendPing("Final deposit complete. Target stacks reached!");
                     BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("stop");
@@ -2612,23 +2657,19 @@ public class Baromine extends Module {
     private void updateBaritoneGoal(Block target) {
         if (!isActive()) return;
         if (mc.player == null) return;
-        if (Modules.get().isActive(PortalMaker.class)) return; // Yield control to PortalMaker
+        if (Modules.get().isActive(PortalMaker.class)) return;
 
-        String blockId = BuiltInRegistries.BLOCK.getKey(target).toString();
-        StringBuilder mineCommand = new StringBuilder("mine ").append(blockId);
+        navigationRetryTicks = 40;
+        Block deepslateVariant = targetMode.get() == TargetMode.Ores && includeDeepslate.get()
+            ? getDeepslateVariant(target) : null;
+        var commands = BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager();
 
-        if (targetMode.get() == TargetMode.Ores && includeDeepslate.get()) {
-            Block deepslateVariant = getDeepslateVariant(target);
-            if (deepslateVariant != null) {
-                String deepslateId = BuiltInRegistries.BLOCK.getKey(deepslateVariant).toString();
-                mineCommand.append(" ").append(deepslateId);
-            }
-        }
-
-        BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("set minYLevelWhileMining " + (minYLevel.get() + 64));
-        BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("set maxYLevelWhileMining " + (maxYLevel.get() + 64));
-
-        BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute(mineCommand.toString());
+        // Strictly uses #mine as the sole navigation/mining command
+        String command = "mine " + BuiltInRegistries.BLOCK.getKey(target);
+        if (deepslateVariant != null) command += " " + BuiltInRegistries.BLOCK.getKey(deepslateVariant);
+        commands.execute("set minYLevelWhileMining " + (minYLevel.get() + 64));
+        commands.execute("set maxYLevelWhileMining " + (maxYLevel.get() + 64));
+        commands.execute(command);
     }
 
     public Block getTargetBlock() {
@@ -2652,7 +2693,6 @@ public class Baromine extends Module {
         Set<Item> validItems = getValidTargetItems();
         int count = 0;
 
-        // 1. Player Inventory
         for (int i = 0; i < mc.player.getInventory().getContainerSize(); i++) {
             ItemStack stack = mc.player.getInventory().getItem(i);
             if (validItems.contains(stack.getItem())) {
@@ -2662,7 +2702,6 @@ public class Baromine extends Module {
             }
         }
 
-        // 2. Ender Chest
         if (mc.player.getEnderChestInventory() != null) {
             for (int i = 0; i < mc.player.getEnderChestInventory().getContainerSize(); i++) {
                 ItemStack stack = mc.player.getEnderChestInventory().getItem(i);
@@ -2727,7 +2766,7 @@ public class Baromine extends Module {
     }
 
     private void stopBaritoneSafely(String reason) {
-        if (Modules.get().isActive(PortalMaker.class)) return; // Don't stop if PortalMaker is using it
+        if (Modules.get().isActive(PortalMaker.class)) return;
         BaritoneAPI.getProvider().getPrimaryBaritone().getCommandManager().execute("stop");
         sendPing("SAFETY STOP: " + reason);
     }
@@ -2751,8 +2790,6 @@ public class Baromine extends Module {
         }
         return false;
     }
-
-    // --- HELPER METHODS: DEPOSIT & INVENTORY ---
 
     private void disconnectSafely(String reason) {
         sendPing(reason);
@@ -2796,14 +2833,36 @@ public class Baromine extends Module {
         if (container == null) return true;
 
         long filledSlots = container.nonEmptyItemCopyStream().filter(stack -> !stack.isEmpty()).count();
-        if (filledSlots >= 27) return false;
+        if (filledSlots >= 27 && container.nonEmptyItemCopyStream().noneMatch(stored -> {
+            if (!validItems.contains(stored.getItem()) || stored.getCount() >= stored.getMaxStackSize()) return false;
+            for (int i = 0; i < 36; i++) {
+                if (ItemStack.matches(stored, mc.player.getInventory().getItem(i))) return true;
+            }
+            return false;
+        })) return false;
 
         return container.nonEmptyItemCopyStream()
             .filter(stack -> !stack.isEmpty())
             .allMatch(stack -> validItems.contains(stack.getItem()));
     }
 
-    // Uses ItemTags so it compiles on both 1.21.4 and 1.21.5+ (and automatically includes 1.21.9+ copper tools)
+    private boolean hasShulkerSpace(ShulkerBoxMenu handler, ItemStack stack) {
+        for (int i = 0; i < 27; i++) {
+            ItemStack stored = handler.getSlot(i).getItem();
+            if (stored.isEmpty() || (ItemStack.matches(stored, stack) && stored.getCount() < stored.getMaxStackSize())) return true;
+        }
+        return false;
+    }
+
+    private int countInventoryItem(Item item) {
+        int count = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getItem(i);
+            if (stack.getItem() == item) count += stack.getCount();
+        }
+        return count;
+    }
+
     private String getToolType(ItemStack stack) {
         if (stack.isEmpty()) return null;
         if (stack.is(ItemTags.PICKAXES)) return "pickaxe";
@@ -2874,7 +2933,6 @@ public class Baromine extends Module {
     private boolean isCombatWeapon(ItemStack stack) {
         if (stack.isEmpty()) return false;
         if (stack.is(ItemTags.SWORDS)) return true;
-        // 1.21.11+ Spears (sit idle on 1.21.4 - 1.21.10)
         Item item = stack.getItem();
         return item == optItem("netherite_spear")
             || item == optItem("diamond_spear")
@@ -2915,8 +2973,6 @@ public class Baromine extends Module {
             Hotbar.set(bestSlot);
         }
     }
-
-    // --- HELPER METHODS: LAVA/WATER SAFETY & WORLD INTERACTION ---
 
     private boolean isWaterNearby(BlockPos center, int radius) {
         if (mc.level == null) return false;
@@ -3059,8 +3115,6 @@ public class Baromine extends Module {
         mc.player.swing(InteractionHand.MAIN_HAND);
     }
 
-    // --- HELPER METHODS: NOTIFICATIONS ---
-
     private void sendPing(String message) {
         if (pingMode.get() == PingMode.Chat || pingMode.get() == PingMode.Both) {
             ChatUtils.sendMsg("Baromine", Component.literal(message));
@@ -3089,7 +3143,6 @@ public class Baromine extends Module {
         };
     }
 
-    // --- BARITONE STATE HELPER ---
     public static boolean isBaritoneIdle() {
         IBaritone baritone = BaritoneAPI.getProvider().getPrimaryBaritone();
         IPathingBehavior pathing = baritone.getPathingBehavior();
@@ -3109,7 +3162,6 @@ public class Baromine extends Module {
                 && !calculatingPath;
     }
 
-    // --- HUD HELPERS ---
     public String getCurrentStatus() {
         if (!isActive()) return "Inactive";
         if (isAutoMending) return "Auto-Mending";

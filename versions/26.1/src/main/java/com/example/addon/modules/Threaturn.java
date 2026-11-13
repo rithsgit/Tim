@@ -7,6 +7,7 @@ import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundEvents;
@@ -14,10 +15,24 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.entity.animal.bee.Bee;
+import net.minecraft.world.entity.animal.panda.Panda;
+import net.minecraft.world.entity.animal.polarbear.PolarBear;
+import net.minecraft.world.entity.animal.wolf.Wolf;
+import net.minecraft.world.entity.monster.EnderMan;
 import java.util.Set;
 
 public class Threaturn extends Module {
+    private static final Set<String> NEUTRAL_MOBS = Set.of(
+        "minecraft:bee", "minecraft:cave_spider", "minecraft:dolphin", "minecraft:drowned",
+        "minecraft:enderman", "minecraft:fox", "minecraft:goat", "minecraft:iron_golem",
+        "minecraft:llama", "minecraft:nautilus", "minecraft:panda", "minecraft:piglin",
+        "minecraft:polar_bear", "minecraft:pufferfish", "minecraft:spider", "minecraft:trader_llama",
+        "minecraft:wolf", "minecraft:zombie_nautilus", "minecraft:zombified_piglin"
+    );
+
     public enum WarningSound {
         WARDEN_ROAR("Warden Roar", SoundEvents.WARDEN_ROAR),
         ELDER_GUARDIAN("Elder Guardian", SoundEvents.ELDER_GUARDIAN_CURSE),
@@ -63,11 +78,11 @@ public class Threaturn extends Module {
         .defaultValue(true).build());
 
     private final Setting<Boolean> onlyHostiles = sgFilters.add(new BoolSetting.Builder()
-        .name("only-hostiles").description("Only count monster spawn group entities.")
+        .name("only-hostiles").description("Count monsters and neutral mobs showing aggression.")
         .defaultValue(false).build());
 
     private final Setting<Boolean> onlyTargeting = sgFilters.add(new BoolSetting.Builder()
-        .name("only-targeting-you").description("Only count mobs actively aggroed onto you.")
+        .name("only-targeting-you").description("Only count mobs targeting you; server targets may not be synced to the client.")
         .defaultValue(false).build());
 
     private final Setting<Boolean> ignoreNamed = sgFilters.add(new BoolSetting.Builder()
@@ -79,7 +94,7 @@ public class Threaturn extends Module {
         .defaultValue(true).build());
 
     private final Setting<Set<EntityType<?>>> entityFilter = sgFilters.add(new EntityTypeListSetting.Builder()
-        .name("entities").description("Specific entity types to count.")
+        .name("entities").description("Specific entity types to count; neutral mobs must show aggression.")
         .defaultValue(new ObjectOpenHashSet<>()).build());
 
     private final Setting<Boolean> playSound = sgAudio.add(new BoolSetting.Builder()
@@ -144,13 +159,16 @@ public class Threaturn extends Module {
             if (ignoreNamed.get() && entity.hasCustomName()) continue;
             if (ignoreTamed.get() && entity instanceof TamableAnimal tameable && tameable.isOwnedBy(mc.player)) continue;
 
+            boolean neutral = entity instanceof NeutralMob || NEUTRAL_MOBS.contains(BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+            if (neutral && !isAggressiveNeutral(entity)) continue;
+
             if (onlyTargeting.get()) {
                 if (!(entity instanceof Mob mob) || mob.getTarget() != mc.player) {
                     continue;
                 }
             }
 
-            boolean isHostile = onlyHostiles.get() && entity.getType().getCategory() == MobCategory.MONSTER;
+            boolean isHostile = onlyHostiles.get() && (neutral || entity.getType().getCategory() == MobCategory.MONSTER);
             boolean isInList = entityFilter.get().contains(entity.getType());
 
             if (isHostile || isInList) {
@@ -165,6 +183,16 @@ public class Threaturn extends Module {
         }
 
         currentNearbyCount = count;
+    }
+
+    private static boolean isAggressiveNeutral(Entity entity) {
+        if (entity instanceof EnderMan enderman && enderman.isCreepy()) return true;
+        if (entity instanceof Bee bee && bee.isAngry()) return true;
+        if (entity instanceof Wolf wolf && wolf.isAngry()) return true;
+        if (entity instanceof PolarBear bear && bear.isStanding()) return true;
+
+        // Pandas override isAggressive() to mean the aggressive gene, not an active attack.
+        return entity instanceof Mob mob && !(entity instanceof Panda) && mob.isAggressive();
     }
 
     private void triggerEmergency(int detectedCount) {

@@ -45,6 +45,15 @@
 - Tweaker
 - Waypearl
 
+Threaturn ignores neutral mobs until they show a client-visible aggression
+signal, including when they are explicitly selected in its entity filter.
+With `only-hostiles` enabled, neutral mobs showing aggression count alongside
+monster spawn-group entities. Minecraft does not synchronize every mob's
+aggression or target to clients, so some provoked mobs may not be detected
+(including pandas and llamas), and `only-targeting-you` may not work reliably.
+An aggression signal can also reflect a mob attacking something other than the
+player. Named and owned pet exclusions still apply.
+
 ## HUDs
 
 - Baromine
@@ -97,6 +106,25 @@ and display duration, and enable angry expressions when damage interrupts
 Sleep Mode.
 
 More modules and HUDs are planned.
+
+### Baromine
+
+The `baritone-mode` setting selects `Goto` (default) or `Mine` for the main
+target. In `Goto` mode, enable and configure Meteor's Nuker to break the desired
+blocks, excluding shulkers and ender chests used for deposits. With deepslate
+variants enabled, navigation alternates between the regular and deepslate
+target when restarting. `Mine` mode asks Baritone to mine both variants when
+enabled. Auto-mending always uses Baritone's `#mine` for XP.
+
+The Y-level safety limits stop the module if crossed; they do not constrain
+Baritone's `#goto` search. `Mine` mode also passes them to Baritone's mining
+settings.
+
+Combat pause only triggers for visible attacking mobs within three blocks. If
+combat remains unresolved for five seconds, navigation resumes and the pause
+has a ten-second cooldown. Auto deposit closes a full shulker, recovers it,
+and stops with a warning if recovery or transfer fails. If a final deposit
+doesn't fit in one shulker, Baromine attempts another available box.
 
 ## Requirements
 

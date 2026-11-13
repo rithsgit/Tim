@@ -10,8 +10,15 @@ import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.SpawnGroup;
+import net.minecraft.entity.mob.Angerable;
+import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.MobEntity;
+import net.minecraft.entity.passive.BeeEntity;
+import net.minecraft.entity.passive.PandaEntity;
+import net.minecraft.entity.passive.PolarBearEntity;
 import net.minecraft.entity.passive.TameableEntity;
+import net.minecraft.entity.passive.WolfEntity;
+import net.minecraft.registry.Registries;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
@@ -19,6 +26,14 @@ import net.minecraft.text.Text;
 import java.util.Set;
 
 public class Threaturn extends Module {
+    private static final Set<String> NEUTRAL_MOBS = Set.of(
+        "minecraft:bee", "minecraft:cave_spider", "minecraft:dolphin", "minecraft:drowned",
+        "minecraft:enderman", "minecraft:fox", "minecraft:goat", "minecraft:iron_golem",
+        "minecraft:llama", "minecraft:nautilus", "minecraft:panda", "minecraft:piglin",
+        "minecraft:polar_bear", "minecraft:pufferfish", "minecraft:spider", "minecraft:trader_llama",
+        "minecraft:wolf", "minecraft:zombie_nautilus", "minecraft:zombified_piglin"
+    );
+
     public enum WarningSound {
         WARDEN_ROAR("Warden Roar", SoundEvents.ENTITY_WARDEN_ROAR),
         ELDER_GUARDIAN("Elder Guardian", SoundEvents.ENTITY_ELDER_GUARDIAN_CURSE),
@@ -64,11 +79,11 @@ public class Threaturn extends Module {
         .defaultValue(true).build());
 
     private final Setting<Boolean> onlyHostiles = sgFilters.add(new BoolSetting.Builder()
-        .name("only-hostiles").description("Only count monster spawn group entities.")
+        .name("only-hostiles").description("Count monsters and neutral mobs showing aggression.")
         .defaultValue(false).build());
 
     private final Setting<Boolean> onlyTargeting = sgFilters.add(new BoolSetting.Builder()
-        .name("only-targeting-you").description("Only count mobs actively aggroed onto you.")
+        .name("only-targeting-you").description("Only count mobs targeting you; server targets may not be synced to the client.")
         .defaultValue(false).build());
 
     private final Setting<Boolean> ignoreNamed = sgFilters.add(new BoolSetting.Builder()
@@ -80,7 +95,7 @@ public class Threaturn extends Module {
         .defaultValue(true).build());
 
     private final Setting<Set<EntityType<?>>> entityFilter = sgFilters.add(new EntityTypeListSetting.Builder()
-        .name("entities").description("Specific entity types to count.")
+        .name("entities").description("Specific entity types to count; neutral mobs must show aggression.")
         .defaultValue(new ObjectOpenHashSet<>()).build());
 
     private final Setting<Boolean> playSound = sgAudio.add(new BoolSetting.Builder()
@@ -145,13 +160,16 @@ public class Threaturn extends Module {
             if (ignoreNamed.get() && entity.hasCustomName()) continue;
             if (ignoreTamed.get() && entity instanceof TameableEntity tameable && tameable.isOwner(mc.player)) continue;
 
+            boolean neutral = entity instanceof Angerable || NEUTRAL_MOBS.contains(Registries.ENTITY_TYPE.getId(entity.getType()).toString());
+            if (neutral && !isAggressiveNeutral(entity)) continue;
+
             if (onlyTargeting.get()) {
                 if (!(entity instanceof MobEntity mob) || mob.getTarget() != mc.player) {
                     continue;
                 }
             }
 
-            boolean isHostile = onlyHostiles.get() && entity.getType().getSpawnGroup() == SpawnGroup.MONSTER;
+            boolean isHostile = onlyHostiles.get() && (neutral || entity.getType().getSpawnGroup() == SpawnGroup.MONSTER);
             boolean isInList = entityFilter.get().contains(entity.getType());
 
             if (isHostile || isInList) {
@@ -166,6 +184,16 @@ public class Threaturn extends Module {
         }
 
         currentNearbyCount = count;
+    }
+
+    private static boolean isAggressiveNeutral(Entity entity) {
+        if (entity instanceof EndermanEntity enderman && enderman.isAngry()) return true;
+        if (entity instanceof BeeEntity bee && bee.hasAngerTime()) return true;
+        if (entity instanceof WolfEntity wolf && wolf.hasAngerTime()) return true;
+        if (entity instanceof PolarBearEntity bear && bear.isWarning()) return true;
+
+        // Pandas override isAttacking() to mean the aggressive gene, not an active attack.
+        return entity instanceof MobEntity mob && !(entity instanceof PandaEntity) && mob.isAttacking();
     }
 
     private void triggerEmergency(int detectedCount) {
